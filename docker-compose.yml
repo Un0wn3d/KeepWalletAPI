@@ -1,0 +1,43 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: keepwallet-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=${POSTGRES_DB:-KeepWallet};Username=${POSTGRES_USER:-KeepWallet};Password=${POSTGRES_PASSWORD:-KeepWallet}
+      Jwt__Issuer: ${JWT_ISSUER:-KeepWalletAPI}
+      Jwt__Audience: ${JWT_AUDIENCE:-KeepWalletClient}
+      Jwt__Key: ${JWT_KEY:-replace-this-with-a-long-random-secret-key-min-32-chars}
+      Auth__UseSecureCookies: ${AUTH_USE_SECURE_COOKIES:-false}
+    ports:
+      - "${API_PORT:-5174}:8080"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: keepwallet-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-KeepWallet}
+      POSTGRES_USER: ${POSTGRES_USER:-KeepWallet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-KeepWallet}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - keepwallet_postgres_data:/var/lib/postgresql/data
+      - ../KeepWalletDB/Postgre.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ../KeepWalletDB/Triggers.sql:/docker-entrypoint-initdb.d/02-triggers.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-KeepWallet} -d ${POSTGRES_DB:-KeepWallet}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  keepwallet_postgres_data:

@@ -1,0 +1,43 @@
+@KeepWalletAPI_HostAddress = http://localhost:5174
+
+GET {{KeepWalletAPI_HostAddress}}/api/roles
+Accept: application/json
+
+###
+
+POST {{KeepWalletAPI_HostAddress}}/api/auth/register
+Content-Type: application/json
+
+{
+  "username": "demo-user",
+  "email": "demo@example.com",
+  "password": "StrongPassword123!",
+  "fullName": "Demo User"
+}
+
+###
+
+POST {{KeepWalletAPI_HostAddress}}/api/auth/login
+Content-Type: application/json
+
+{
+  "login": "demo@example.com",
+  "password": "StrongPassword123!"
+}
+
+###
+
+POST {{KeepWalletAPI_HostAddress}}/api/auth/refresh
+Content-Type: application/json
+
+{}
+
+###
+
+GET {{KeepWalletAPI_HostAddress}}/api/auth/me
+Accept: application/json
+
+###
+
+POST {{KeepWalletAPI_HostAddress}}/api/auth/logout
+Content-Type: application/json

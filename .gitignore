@@ -1,0 +1,58 @@
+# Build artifacts
+bin/
+obj/
+out/
+
+# Test artifacts
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE folders
+.vs/
+.vscode/
+.idea/
+_ReSharper*/
+*.[Rr]e[Ss]harper
+
+# Logs
+*.log
+logs/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# Local app configuration overrides
+appsettings.Local.json
+appsettings.*.local.json
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Docker/local volumes
+docker-data/
+postgres-data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# NuGet packages
+*.nupkg
+*.snupkg
+packages/
