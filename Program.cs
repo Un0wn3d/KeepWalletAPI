@@ -106,6 +106,10 @@ builder.Services.AddAuthorization(options =>
 
 var app = builder.Build();
 
+await EnsureUserCategoryPreferenceTableAsync(app.Services);
+await EnsureGroupMembershipSchemaAsync(app.Services);
+await EnsureTransactionBalanceTriggersAsync(app.Services);
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -188,7 +192,8 @@ app.MapGet("/api/categories", async (ClaimsPrincipal principal, AppDbContext db,
         .Select(x => new CategoryResponse(
             x.Category.Id,
             x.Category.Name,
-            x.Category.Type == CategoryType.Income ? "income" : "expense"))
+            x.Category.Type == CategoryType.Income ? "income" : "expense",
+            x.Category.IconKey))
         .ToListAsync(ct);
 
     return Results.Ok(categories);
@@ -217,13 +222,15 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
         return Results.Ok(new CategoryResponse(
             existing.Id,
             existing.Name,
-            existing.Type == CategoryType.Income ? "income" : "expense"));
+            existing.Type == CategoryType.Income ? "income" : "expense",
+            existing.IconKey));
     }
 
     var category = new Category
     {
         Name = name,
-        Type = type.Value
+        Type = type.Value,
+        IconKey = NormalizeIconKey(request.IconKey, type.Value)
     };
 
     db.Categories.Add(category);
@@ -232,7 +239,35 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
     return Results.Created($"/api/categories/{category.Id}", new CategoryResponse(
         category.Id,
         category.Name,
-        category.Type == CategoryType.Income ? "income" : "expense"));
+        category.Type == CategoryType.Income ? "income" : "expense",
+        category.IconKey));
+}).RequireAuthorization();
+
+app.MapPatch("/api/categories/{categoryId:int}", async (
+    int categoryId,
+    UpdateCategoryRequest request,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var category = await db.Categories.FirstOrDefaultAsync(c => c.Id == categoryId, ct);
+    if (category is null) return Results.NotFound(new { message = "Category does not exist." });
+
+    if (!string.IsNullOrWhiteSpace(request.Name))
+    {
+        category.Name = request.Name.Trim();
+    }
+
+    if (request.IconKey is not null)
+    {
+        category.IconKey = NormalizeIconKey(request.IconKey, category.Type);
+    }
+
+    await db.SaveChangesAsync(ct);
+    return Results.Ok(new CategoryResponse(
+        category.Id,
+        category.Name,
+        category.Type == CategoryType.Income ? "income" : "expense",
+        category.IconKey));
 }).RequireAuthorization();
 
 app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -272,6 +307,7 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
             x.Category.Id,
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
+            x.Category.IconKey,
             !hasSavedPreferences || selectedIdSet.Contains(x.Category.Id)))
         .ToListAsync(ct);
 
@@ -310,6 +346,108 @@ app.MapPut("/api/user-categories", async (
 
     await db.SaveChangesAsync(ct);
     return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapDelete("/api/categories/{categoryId:int}", async (
+    int categoryId,
+    ClaimsPrincipal principal,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var category = await db.Categories.FirstOrDefaultAsync(c => c.Id == categoryId, ct);
+    if (category is null) return Results.NotFound(new { message = "Category does not exist." });
+
+    var isUsed = await db.Transactions.AnyAsync(t => t.CategoryId == categoryId, ct) ||
+        await db.Budgets.AnyAsync(b => b.CategoryId == categoryId, ct);
+    if (isUsed)
+    {
+        return Results.Conflict(new { message = "Category is used by transactions or budgets. Merge it into another category before deleting." });
+    }
+
+    var preferences = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == categoryId)
+        .ToListAsync(ct);
+    db.UserCategoryPreferences.RemoveRange(preferences);
+    db.Categories.Remove(category);
+
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/api/categories/{sourceCategoryId:int}/merge", async (
+    int sourceCategoryId,
+    MergeCategoryRequest request,
+    ClaimsPrincipal principal,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    if (sourceCategoryId == request.TargetCategoryId)
+    {
+        return Results.BadRequest(new { message = "Choose a different target category." });
+    }
+
+    var source = await db.Categories.FirstOrDefaultAsync(c => c.Id == sourceCategoryId, ct);
+    var target = await db.Categories.FirstOrDefaultAsync(c => c.Id == request.TargetCategoryId, ct);
+    if (source is null || target is null)
+    {
+        return Results.NotFound(new { message = "Source or target category does not exist." });
+    }
+
+    if (source.Type != target.Type)
+    {
+        return Results.BadRequest(new { message = "Categories must have the same type." });
+    }
+
+    await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+    var transactions = await db.Transactions
+        .Where(t => t.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    foreach (var transaction in transactions)
+    {
+        transaction.CategoryId = target.Id;
+    }
+
+    var sourceBudgets = await db.Budgets
+        .Where(b => b.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    foreach (var budget in sourceBudgets)
+    {
+        budget.CategoryId = target.Id;
+    }
+
+    var sourcePreferences = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    db.UserCategoryPreferences.RemoveRange(sourcePreferences);
+
+    var preferenceUserIds = sourcePreferences.Select(x => x.UserId).Distinct().ToArray();
+    var existingTargetPreferenceUserIds = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == target.Id && preferenceUserIds.Contains(x.UserId))
+        .Select(x => x.UserId)
+        .ToListAsync(ct);
+    var missingPreferenceUserIds = preferenceUserIds.Except(existingTargetPreferenceUserIds).ToArray();
+    db.UserCategoryPreferences.AddRange(missingPreferenceUserIds.Select(preferenceUserId => new UserCategoryPreference
+    {
+        UserId = preferenceUserId,
+        CategoryId = target.Id
+    }));
+
+    db.Categories.Remove(source);
+    await db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+
+    return Results.Ok(new CategoryResponse(
+        target.Id,
+        target.Name,
+        target.Type == CategoryType.Income ? "income" : "expense",
+        target.IconKey));
 }).RequireAuthorization();
 
 app.MapGet("/api/budgets", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1485,6 +1623,17 @@ static CategoryType? NormalizeCategoryType(string? type)
     };
 }
 
+static string NormalizeIconKey(string? iconKey, CategoryType categoryType)
+{
+    var normalized = (iconKey ?? string.Empty).Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return categoryType == CategoryType.Income ? "income" : "other";
+    }
+
+    return normalized.Length > 50 ? normalized[..50] : normalized;
+}
+
 static string ToRoleName(UserRole role) =>
     role == UserRole.Admin ? "admin" : "user";
 
@@ -1557,6 +1706,141 @@ static async Task SetAuditContextAsync(AppDbContext db, Guid userId, string? dev
     await db.Database.ExecuteSqlInterpolatedAsync(
         $"SELECT set_config('app.current_user_id', {userId.ToString()}, false), set_config('app.device', {device ?? string.Empty}, false);",
         ct);
+}
+
+static async Task EnsureUserCategoryPreferenceTableAsync(IServiceProvider services)
+{
+    using var scope = services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    if (!db.Database.IsRelational())
+    {
+        return;
+    }
+
+    await db.Database.ExecuteSqlRawAsync("""
+        CREATE TABLE IF NOT EXISTS user_category_preferences (
+            user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            category_id integer NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, category_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_category_preferences_user_id
+            ON user_category_preferences(user_id);
+    """);
+}
+
+static async Task EnsureGroupMembershipSchemaAsync(IServiceProvider services)
+{
+    using var scope = services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    if (!db.Database.IsRelational())
+    {
+        return;
+    }
+
+    await db.Database.ExecuteSqlRawAsync("""
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.table_constraints
+            WHERE table_name = 'group_members'
+              AND constraint_name = 'group_members_pkey'
+        ) THEN
+            ALTER TABLE group_members DROP CONSTRAINT group_members_pkey;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM information_schema.table_constraints
+            WHERE table_name = 'group_members'
+              AND constraint_type = 'PRIMARY KEY'
+        ) THEN
+            ALTER TABLE group_members ADD PRIMARY KEY (group_id, user_id);
+        END IF;
+
+        CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
+    END $$;
+    """);
+}
+
+static async Task EnsureTransactionBalanceTriggersAsync(IServiceProvider services)
+{
+    using var scope = services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    if (!db.Database.IsRelational())
+    {
+        return;
+    }
+
+    await db.Database.ExecuteSqlRawAsync("""
+        DROP TRIGGER IF EXISTS trg_update_balance_after_insert ON transactions;
+        DROP TRIGGER IF EXISTS trg_update_balance_after_change ON transactions;
+
+        CREATE OR REPLACE FUNCTION fn_apply_transaction_balance(
+            p_account_id uuid,
+            p_category_id integer,
+            p_amount numeric,
+            p_multiplier integer
+        )
+        RETURNS void AS $fn$
+        DECLARE
+            v_category_type category_type;
+            v_delta numeric(15,2);
+        BEGIN
+            SELECT c.type
+            INTO v_category_type
+            FROM categories c
+            WHERE c.id = p_category_id;
+
+            IF v_category_type IS NULL THEN
+                RAISE EXCEPTION 'Category % does not exist', p_category_id;
+            END IF;
+
+            v_delta := CASE
+                WHEN v_category_type = 'income' THEN p_amount
+                ELSE -p_amount
+            END;
+
+            UPDATE accounts
+            SET balance = balance + (v_delta * p_multiplier),
+                updated_at = NOW()
+            WHERE id = p_account_id;
+        END;
+        $fn$ LANGUAGE plpgsql;
+
+        CREATE OR REPLACE FUNCTION fn_update_account_balance()
+        RETURNS trigger AS $trg$
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                IF NEW.recurring_payments_id IS NULL THEN
+                    PERFORM fn_apply_transaction_balance(NEW.account_id, NEW.category_id, NEW.amount, 1);
+                END IF;
+                RETURN NEW;
+            ELSIF TG_OP = 'UPDATE' THEN
+                IF OLD.recurring_payments_id IS NULL THEN
+                    PERFORM fn_apply_transaction_balance(OLD.account_id, OLD.category_id, OLD.amount, -1);
+                END IF;
+
+                IF NEW.recurring_payments_id IS NULL THEN
+                    PERFORM fn_apply_transaction_balance(NEW.account_id, NEW.category_id, NEW.amount, 1);
+                END IF;
+                RETURN NEW;
+            ELSIF TG_OP = 'DELETE' THEN
+                IF OLD.recurring_payments_id IS NULL THEN
+                    PERFORM fn_apply_transaction_balance(OLD.account_id, OLD.category_id, OLD.amount, -1);
+                END IF;
+                RETURN OLD;
+            END IF;
+
+            RETURN NULL;
+        END;
+        $trg$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER trg_update_balance_after_change
+            AFTER INSERT OR UPDATE OR DELETE ON transactions
+            FOR EACH ROW
+            EXECUTE FUNCTION fn_update_account_balance();
+        """);
 }
 
 static void AppendAuthCookies(
