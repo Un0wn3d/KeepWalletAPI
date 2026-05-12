@@ -188,7 +188,8 @@ app.MapGet("/api/categories", async (ClaimsPrincipal principal, AppDbContext db,
         .Select(x => new CategoryResponse(
             x.Category.Id,
             x.Category.Name,
-            x.Category.Type == CategoryType.Income ? "income" : "expense"))
+            x.Category.Type == CategoryType.Income ? "income" : "expense",
+            x.Category.IconKey))
         .ToListAsync(ct);
 
     return Results.Ok(categories);
@@ -217,13 +218,15 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
         return Results.Ok(new CategoryResponse(
             existing.Id,
             existing.Name,
-            existing.Type == CategoryType.Income ? "income" : "expense"));
+            existing.Type == CategoryType.Income ? "income" : "expense",
+            existing.IconKey));
     }
 
     var category = new Category
     {
         Name = name,
-        Type = type.Value
+        Type = type.Value,
+        IconKey = NormalizeIconKey(request.IconKey, type.Value)
     };
 
     db.Categories.Add(category);
@@ -232,7 +235,35 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
     return Results.Created($"/api/categories/{category.Id}", new CategoryResponse(
         category.Id,
         category.Name,
-        category.Type == CategoryType.Income ? "income" : "expense"));
+        category.Type == CategoryType.Income ? "income" : "expense",
+        category.IconKey));
+}).RequireAuthorization();
+
+app.MapPatch("/api/categories/{categoryId:int}", async (
+    int categoryId,
+    UpdateCategoryRequest request,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var category = await db.Categories.FirstOrDefaultAsync(c => c.Id == categoryId, ct);
+    if (category is null) return Results.NotFound(new { message = "Category does not exist." });
+
+    if (!string.IsNullOrWhiteSpace(request.Name))
+    {
+        category.Name = request.Name.Trim();
+    }
+
+    if (request.IconKey is not null)
+    {
+        category.IconKey = NormalizeIconKey(request.IconKey, category.Type);
+    }
+
+    await db.SaveChangesAsync(ct);
+    return Results.Ok(new CategoryResponse(
+        category.Id,
+        category.Name,
+        category.Type == CategoryType.Income ? "income" : "expense",
+        category.IconKey));
 }).RequireAuthorization();
 
 app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -272,6 +303,7 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
             x.Category.Id,
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
+            x.Category.IconKey,
             !hasSavedPreferences || selectedIdSet.Contains(x.Category.Id)))
         .ToListAsync(ct);
 
@@ -410,7 +442,8 @@ app.MapPost("/api/categories/{sourceCategoryId:int}/merge", async (
     return Results.Ok(new CategoryResponse(
         target.Id,
         target.Name,
-        target.Type == CategoryType.Income ? "income" : "expense"));
+        target.Type == CategoryType.Income ? "income" : "expense",
+        target.IconKey));
 }).RequireAuthorization();
 
 app.MapGet("/api/budgets", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1584,6 +1617,17 @@ static CategoryType? NormalizeCategoryType(string? type)
         "expense" => CategoryType.Expense,
         _ => null
     };
+}
+
+static string NormalizeIconKey(string? iconKey, CategoryType categoryType)
+{
+    var normalized = (iconKey ?? string.Empty).Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return categoryType == CategoryType.Income ? "income" : "other";
+    }
+
+    return normalized.Length > 50 ? normalized[..50] : normalized;
 }
 
 static string ToRoleName(UserRole role) =>

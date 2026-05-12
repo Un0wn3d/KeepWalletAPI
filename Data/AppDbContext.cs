@@ -189,6 +189,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
             entity.Property(x => x.Type).HasColumnName("type").HasColumnType("category_type");
+            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50).HasDefaultValue("other");
         });
 
         modelBuilder.Entity<PopularCategoryLast30Days>(entity =>
