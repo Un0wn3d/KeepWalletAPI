@@ -21,3 +21,7 @@ public record UserCategoryPreferenceResponse(
 public record UpdateUserCategoryPreferencesRequest(
     IReadOnlyList<int> SelectedCategoryIds
 );
+
+public record MergeCategoryRequest(
+    int TargetCategoryId
+);

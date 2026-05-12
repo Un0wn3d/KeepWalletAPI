@@ -312,6 +312,107 @@ app.MapPut("/api/user-categories", async (
     return Results.NoContent();
 }).RequireAuthorization();
 
+app.MapDelete("/api/categories/{categoryId:int}", async (
+    int categoryId,
+    ClaimsPrincipal principal,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var category = await db.Categories.FirstOrDefaultAsync(c => c.Id == categoryId, ct);
+    if (category is null) return Results.NotFound(new { message = "Category does not exist." });
+
+    var isUsed = await db.Transactions.AnyAsync(t => t.CategoryId == categoryId, ct) ||
+        await db.Budgets.AnyAsync(b => b.CategoryId == categoryId, ct);
+    if (isUsed)
+    {
+        return Results.Conflict(new { message = "Category is used by transactions or budgets. Merge it into another category before deleting." });
+    }
+
+    var preferences = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == categoryId)
+        .ToListAsync(ct);
+    db.UserCategoryPreferences.RemoveRange(preferences);
+    db.Categories.Remove(category);
+
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/api/categories/{sourceCategoryId:int}/merge", async (
+    int sourceCategoryId,
+    MergeCategoryRequest request,
+    ClaimsPrincipal principal,
+    AppDbContext db,
+    CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    if (sourceCategoryId == request.TargetCategoryId)
+    {
+        return Results.BadRequest(new { message = "Choose a different target category." });
+    }
+
+    var source = await db.Categories.FirstOrDefaultAsync(c => c.Id == sourceCategoryId, ct);
+    var target = await db.Categories.FirstOrDefaultAsync(c => c.Id == request.TargetCategoryId, ct);
+    if (source is null || target is null)
+    {
+        return Results.NotFound(new { message = "Source or target category does not exist." });
+    }
+
+    if (source.Type != target.Type)
+    {
+        return Results.BadRequest(new { message = "Categories must have the same type." });
+    }
+
+    await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+    var transactions = await db.Transactions
+        .Where(t => t.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    foreach (var transaction in transactions)
+    {
+        transaction.CategoryId = target.Id;
+    }
+
+    var sourceBudgets = await db.Budgets
+        .Where(b => b.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    foreach (var budget in sourceBudgets)
+    {
+        budget.CategoryId = target.Id;
+    }
+
+    var sourcePreferences = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == sourceCategoryId)
+        .ToListAsync(ct);
+    db.UserCategoryPreferences.RemoveRange(sourcePreferences);
+
+    var preferenceUserIds = sourcePreferences.Select(x => x.UserId).Distinct().ToArray();
+    var existingTargetPreferenceUserIds = await db.UserCategoryPreferences
+        .Where(x => x.CategoryId == target.Id && preferenceUserIds.Contains(x.UserId))
+        .Select(x => x.UserId)
+        .ToListAsync(ct);
+    var missingPreferenceUserIds = preferenceUserIds.Except(existingTargetPreferenceUserIds).ToArray();
+    db.UserCategoryPreferences.AddRange(missingPreferenceUserIds.Select(preferenceUserId => new UserCategoryPreference
+    {
+        UserId = preferenceUserId,
+        CategoryId = target.Id
+    }));
+
+    db.Categories.Remove(source);
+    await db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+
+    return Results.Ok(new CategoryResponse(
+        target.Id,
+        target.Name,
+        target.Type == CategoryType.Income ? "income" : "expense"));
+}).RequireAuthorization();
+
 app.MapGet("/api/budgets", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
