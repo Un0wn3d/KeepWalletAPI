@@ -4,6 +4,7 @@ namespace KeepWalletAPI.Contracts;
 
 public record CreateTransactionRequest(
     Guid AccountId,
+    Guid? GroupId,
     int CategoryId,
     int? RecurringPaymentId,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
@@ -13,6 +14,7 @@ public record CreateTransactionRequest(
 
 public record UpdateTransactionRequest(
     Guid AccountId,
+    Guid? GroupId,
     int CategoryId,
     int? RecurringPaymentId,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
@@ -23,6 +25,9 @@ public record UpdateTransactionRequest(
 public record TransactionResponse(
     int Id,
     Guid AccountId,
+    Guid? GroupId,
+    string? GroupName,
+    string? SharedBy,
     int CategoryId,
     int? RecurringPaymentId,
     decimal Amount,

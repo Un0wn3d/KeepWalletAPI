@@ -13,4 +13,5 @@ public class BankAccount
     public DateTimeOffset UpdatedAt { get; set; }
 
     public User? User { get; set; }
+    public Group? Group { get; set; }
 }

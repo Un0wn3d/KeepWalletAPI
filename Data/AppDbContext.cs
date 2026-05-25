@@ -96,6 +96,11 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasForeignKey(x => x.AccountId)
                 .OnDelete(DeleteBehavior.Cascade);
 
+            entity.HasOne(x => x.Group)
+                .WithMany()
+                .HasForeignKey(x => x.GroupId)
+                .OnDelete(DeleteBehavior.SetNull);
+
             entity.HasIndex(x => new { x.AccountId, x.TransactionDate }).HasDatabaseName("idx_transactions_account_date");
             entity.HasIndex(x => new { x.AccountId, x.CategoryId }).HasDatabaseName("idx_transactions_account_type");
         });
@@ -121,6 +126,11 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .WithMany()
                 .HasForeignKey(x => x.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.Group)
+                .WithMany()
+                .HasForeignKey(x => x.GroupId)
+                .OnDelete(DeleteBehavior.SetNull);
 
             entity.HasIndex(x => x.UserId).HasDatabaseName("idx_accounts_user_id");
         });
@@ -266,6 +276,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
             entity.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
+            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50).HasDefaultValue("other");
             entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
         });
 

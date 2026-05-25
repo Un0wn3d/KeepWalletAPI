@@ -11,6 +11,7 @@ public class Group
 {
     public Guid Id { get; set; }
     public string Name { get; set; } = string.Empty;
+    public string? IconKey { get; set; } = "other";
     public DateTimeOffset CreatedAt { get; set; }
 }
 

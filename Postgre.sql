@@ -17,6 +17,7 @@ CREATE TABLE users (
 CREATE TYPE user_group_role AS ENUM ('owner', 'member', 'viewer');
 CREATE TABLE groups (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    icon_key      VARCHAR(50),
     name          VARCHAR(100) NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

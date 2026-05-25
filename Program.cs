@@ -107,6 +107,7 @@ builder.Services.AddAuthorization(options =>
 var app = builder.Build();
 
 await EnsureUserCategoryPreferenceTableAsync(app.Services);
+await EnsureCategoryIconKeysAsync(app.Services);
 await EnsureGroupMembershipSchemaAsync(app.Services);
 await EnsureTransactionBalanceTriggersAsync(app.Services);
 
@@ -193,7 +194,7 @@ app.MapGet("/api/categories", async (ClaimsPrincipal principal, AppDbContext db,
             x.Category.Id,
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
-            x.Category.IconKey))
+            x.Category.IconKey ?? (x.Category.Type == CategoryType.Income ? "income" : "other")))
         .ToListAsync(ct);
 
     return Results.Ok(categories);
@@ -223,7 +224,7 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
             existing.Id,
             existing.Name,
             existing.Type == CategoryType.Income ? "income" : "expense",
-            existing.IconKey));
+            NormalizeIconKey(existing.IconKey, existing.Type)));
     }
 
     var category = new Category
@@ -240,7 +241,7 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
         category.Id,
         category.Name,
         category.Type == CategoryType.Income ? "income" : "expense",
-        category.IconKey));
+        NormalizeIconKey(category.IconKey, category.Type)));
 }).RequireAuthorization();
 
 app.MapPatch("/api/categories/{categoryId:int}", async (
@@ -267,7 +268,7 @@ app.MapPatch("/api/categories/{categoryId:int}", async (
         category.Id,
         category.Name,
         category.Type == CategoryType.Income ? "income" : "expense",
-        category.IconKey));
+        NormalizeIconKey(category.IconKey, category.Type)));
 }).RequireAuthorization();
 
 app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -307,7 +308,7 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
             x.Category.Id,
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
-            x.Category.IconKey,
+            x.Category.IconKey ?? (x.Category.Type == CategoryType.Income ? "income" : "other"),
             !hasSavedPreferences || selectedIdSet.Contains(x.Category.Id)))
         .ToListAsync(ct);
 
@@ -447,7 +448,7 @@ app.MapPost("/api/categories/{sourceCategoryId:int}/merge", async (
         target.Id,
         target.Name,
         target.Type == CategoryType.Income ? "income" : "expense",
-        target.IconKey));
+        NormalizeIconKey(target.IconKey, target.Type)));
 }).RequireAuthorization();
 
 app.MapGet("/api/budgets", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -680,7 +681,7 @@ app.MapGet("/api/groups", async (ClaimsPrincipal principal, AppDbContext db, Can
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var groups = await db.GroupMembers
+    var groupRows = await db.GroupMembers
         .AsNoTracking()
         .Where(m => m.UserId == userId.Value)
         .Join(db.Groups,
@@ -694,6 +695,7 @@ app.MapGet("/api/groups", async (ClaimsPrincipal principal, AppDbContext db, Can
             {
                 x.Group.Id,
                 x.Group.Name,
+                x.Group.IconKey,
                 x.Group.CreatedAt,
                 x.Member.Role,
                 MemberCount = members.Count()
@@ -702,10 +704,15 @@ app.MapGet("/api/groups", async (ClaimsPrincipal principal, AppDbContext db, Can
         .Select(g => new GroupResponse(
             g.Id,
             g.Name,
+            g.IconKey ?? "other",
             g.Role == UserGroupRole.Member ? "member" : g.Role == UserGroupRole.Viewer ? "viewer" : "owner",
             g.CreatedAt,
             g.MemberCount))
         .ToListAsync(ct);
+
+    var groups = groupRows
+        .Select(g => g with { IconKey = NormalizeGroupIconKey(g.IconKey) })
+        .ToList();
 
     return Results.Ok(groups);
 }).RequireAuthorization();
@@ -717,7 +724,8 @@ app.MapPost("/api/groups", async (CreateGroupRequest request, ClaimsPrincipal pr
 
     var group = new Group
     {
-        Name = request.Name.Trim()
+        Name = request.Name.Trim(),
+        IconKey = NormalizeGroupIconKey(request.IconKey)
     };
 
     if (string.IsNullOrWhiteSpace(group.Name))
@@ -738,7 +746,35 @@ app.MapPost("/api/groups", async (CreateGroupRequest request, ClaimsPrincipal pr
     db.GroupMembers.Add(member);
     await db.SaveChangesAsync(ct);
 
-    return Results.Created($"/api/groups/{group.Id}", new GroupResponse(group.Id, group.Name, "owner", group.CreatedAt, 1));
+    return Results.Created($"/api/groups/{group.Id}", new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), "owner", group.CreatedAt, 1));
+}).RequireAuthorization();
+
+app.MapPatch("/api/groups/{id:guid}", async (Guid id, UpdateGroupRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
+    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
+
+    var name = request.Name.Trim();
+    if (string.IsNullOrWhiteSpace(name))
+    {
+        return Results.BadRequest(new { message = "Group name is required." });
+    }
+
+    var group = await db.Groups.FirstOrDefaultAsync(g => g.Id == id, ct);
+    if (group is null) return Results.NotFound();
+
+    group.Name = name;
+    if (request.IconKey is not null)
+    {
+        group.IconKey = NormalizeGroupIconKey(request.IconKey);
+    }
+    await db.SaveChangesAsync(ct);
+
+    var memberCount = await db.GroupMembers.CountAsync(m => m.GroupId == id, ct);
+    return Results.Ok(new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), "owner", group.CreatedAt, memberCount));
 }).RequireAuthorization();
 
 app.MapGet("/api/groups/{id:guid}/members", async (Guid id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -755,14 +791,15 @@ app.MapGet("/api/groups/{id:guid}/members", async (Guid id, ClaimsPrincipal prin
         .Join(db.Users,
             m => m.UserId,
             u => u.Id,
-            (m, u) => new GroupMemberResponse(
-                m.GroupId,
-                u.Id,
-                u.Username,
-                u.FullName,
-                m.Role == UserGroupRole.Member ? "member" : m.Role == UserGroupRole.Viewer ? "viewer" : "owner",
-                m.JoinedAt))
-        .OrderBy(m => m.Username)
+            (m, u) => new { Member = m, User = u })
+        .OrderBy(x => x.User.Username)
+        .Select(x => new GroupMemberResponse(
+                x.Member.GroupId,
+                x.User.Id,
+                x.User.Username,
+                x.User.FullName,
+                x.Member.Role == UserGroupRole.Member ? "member" : x.Member.Role == UserGroupRole.Viewer ? "viewer" : "owner",
+                x.Member.JoinedAt))
         .ToListAsync(ct);
 
     return Results.Ok(members);
@@ -802,13 +839,88 @@ app.MapPost("/api/groups/{id:guid}/members", async (Guid id, AddGroupMemberReque
     return Results.NoContent();
 }).RequireAuthorization();
 
+app.MapDelete("/api/groups/{id:guid}", async (Guid id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
+    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
+
+    var group = await db.Groups.FirstOrDefaultAsync(g => g.Id == id, ct);
+    if (group is null) return Results.NotFound();
+
+    var bankAccounts = await db.BankAccounts.Where(a => a.GroupId == id).ToListAsync(ct);
+    foreach (var account in bankAccounts)
+    {
+        account.GroupId = null;
+        account.UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    var savings = await db.Savings.Where(s => s.GroupId == id).ToListAsync(ct);
+    foreach (var saving in savings)
+    {
+        saving.GroupId = null;
+    }
+
+    var transactions = await db.Transactions.Where(t => t.GroupId == id).ToListAsync(ct);
+    foreach (var transaction in transactions)
+    {
+        transaction.GroupId = null;
+    }
+
+    var members = await db.GroupMembers.Where(m => m.GroupId == id).ToListAsync(ct);
+    db.GroupMembers.RemoveRange(members);
+    db.Groups.Remove(group);
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPatch("/api/groups/{id:guid}/members/{memberUserId:guid}", async (Guid id, Guid memberUserId, UpdateGroupMemberRoleRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
+    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
+
+    var member = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == memberUserId, ct);
+    if (member is null) return Results.NotFound();
+    if (member.Role == UserGroupRole.Owner) return Results.BadRequest(new { message = "Transfer ownership to change the owner role." });
+
+    var role = ParseGroupRole(request.RoleName);
+    if (role == UserGroupRole.Owner) return Results.BadRequest(new { message = "Use owner transfer endpoint." });
+
+    member.Role = role;
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/api/groups/{id:guid}/transfer-owner", async (Guid id, TransferGroupOwnerRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
+    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
+    if (request.NewOwnerUserId == userId.Value) return Results.BadRequest(new { message = "You are already the owner." });
+
+    var newOwner = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == request.NewOwnerUserId, ct);
+    if (newOwner is null) return Results.NotFound();
+
+    requester.Role = UserGroupRole.Member;
+    newOwner.Role = UserGroupRole.Owner;
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
 app.MapDelete("/api/groups/{id:guid}/members/{memberUserId:guid}", async (Guid id, Guid memberUserId, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
     var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
-    if (requester is null || requester.Role is UserGroupRole.Viewer) return Results.NotFound();
+    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
 
     if (memberUserId == userId.Value)
     {
@@ -817,6 +929,7 @@ app.MapDelete("/api/groups/{id:guid}/members/{memberUserId:guid}", async (Guid i
 
     var member = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == memberUserId, ct);
     if (member is null) return Results.NotFound();
+    if (member.Role == UserGroupRole.Owner) return Results.BadRequest(new { message = "Transfer ownership before removing the owner." });
 
     db.GroupMembers.Remove(member);
     await db.SaveChangesAsync(ct);
@@ -1105,6 +1218,12 @@ app.MapPost("/api/bank-accounts", async (CreateBankAccountRequest request, Claim
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
+    if (request.GroupId.HasValue)
+    {
+        var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+        if (!canShare) return Results.NotFound();
+    }
+
     if (request.IsDefault)
     {
         await ClearDefaultBankAccountsAsync(db, userId.Value, ct);
@@ -1117,6 +1236,7 @@ app.MapPost("/api/bank-accounts", async (CreateBankAccountRequest request, Claim
         Currency = request.Currency.Trim().ToUpperInvariant(),
         Balance = request.Balance,
         IsDefault = request.IsDefault,
+        GroupId = request.GroupId,
         CreatedAt = DateTimeOffset.UtcNow,
         UpdatedAt = DateTimeOffset.UtcNow
     };
@@ -1140,11 +1260,28 @@ app.MapPut("/api/bank-accounts/{id:guid}", async (Guid id, UpdateBankAccountRequ
         await ClearDefaultBankAccountsAsync(db, userId.Value, ct);
     }
 
+    if (request.GroupId.HasValue)
+    {
+        var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+        if (!canShare) return Results.NotFound();
+    }
+
+    var previousGroupId = account.GroupId;
     account.Name = request.Name.Trim();
     account.Currency = request.Currency.Trim().ToUpperInvariant();
     account.Balance = request.Balance;
     account.IsDefault = request.IsDefault;
+    account.GroupId = request.GroupId;
     account.UpdatedAt = DateTimeOffset.UtcNow;
+
+    var accountTransactions = await db.Transactions.Where(t => t.AccountId == account.Id).ToListAsync(ct);
+    foreach (var transaction in accountTransactions)
+    {
+        if (transaction.GroupId is null || transaction.GroupId == previousGroupId)
+        {
+            transaction.GroupId = request.GroupId;
+        }
+    }
 
     await db.SaveChangesAsync(ct);
     return Results.Ok(ToBankAccountResponse(account));
@@ -1500,9 +1637,20 @@ app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext d
     var transactions = await db.Transactions
         .AsNoTracking()
         .Where(t => t.RecurringPaymentId == null && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.GroupId && m.UserId == userId.Value)) ||
             (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
         .OrderByDescending(t => t.TransactionDate)
-        .Select(t => new TransactionResponse(t.Id, t.AccountId, t.CategoryId, t.RecurringPaymentId, t.Amount, t.Description, t.TransactionDate))
+        .Select(t => new TransactionResponse(
+            t.Id,
+            t.AccountId,
+            t.GroupId,
+            t.Group != null ? t.Group.Name : null,
+            t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
+            t.CategoryId,
+            t.RecurringPaymentId,
+            t.Amount,
+            t.Description,
+            t.TransactionDate))
         .ToListAsync(ct);
 
     return Results.Ok(transactions);
@@ -1516,8 +1664,19 @@ app.MapGet("/api/transactions/{id:int}", async (int id, ClaimsPrincipal principa
     var transaction = await db.Transactions
         .AsNoTracking()
         .Where(t => t.Id == id && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.GroupId && m.UserId == userId.Value)) ||
             (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
-        .Select(t => new TransactionResponse(t.Id, t.AccountId, t.CategoryId, t.RecurringPaymentId, t.Amount, t.Description, t.TransactionDate))
+        .Select(t => new TransactionResponse(
+            t.Id,
+            t.AccountId,
+            t.GroupId,
+            t.Group != null ? t.Group.Name : null,
+            t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
+            t.CategoryId,
+            t.RecurringPaymentId,
+            t.Amount,
+            t.Description,
+            t.TransactionDate))
         .FirstOrDefaultAsync(ct);
 
     return transaction is null ? Results.NotFound() : Results.Ok(transaction);
@@ -1532,10 +1691,16 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
         (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transactionAccount is null) return Results.BadRequest(new { message = "Account does not exist." });
 
+    if (request.GroupId.HasValue)
+    {
+        var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+        if (!canShare) return Results.NotFound();
+    }
+
     var transaction = new Transaction
     {
         AccountId = request.AccountId,
-        GroupId = transactionAccount.GroupId,
+        GroupId = request.GroupId ?? transactionAccount.GroupId,
         CategoryId = request.CategoryId,
         RecurringPaymentId = request.RecurringPaymentId,
         Amount = request.Amount,
@@ -1563,8 +1728,14 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
         (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (targetAccount is null) return Results.BadRequest(new { message = "Account does not exist." });
 
+    if (request.GroupId.HasValue)
+    {
+        var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+        if (!canShare) return Results.NotFound();
+    }
+
     transaction.AccountId = request.AccountId;
-    transaction.GroupId = targetAccount.GroupId;
+    transaction.GroupId = request.GroupId ?? targetAccount.GroupId;
     transaction.CategoryId = request.CategoryId;
     transaction.RecurringPaymentId = request.RecurringPaymentId;
     transaction.Amount = request.Amount;
@@ -1634,6 +1805,17 @@ static string NormalizeIconKey(string? iconKey, CategoryType categoryType)
     return normalized.Length > 50 ? normalized[..50] : normalized;
 }
 
+static string NormalizeGroupIconKey(string? iconKey)
+{
+    var normalized = (iconKey ?? string.Empty).Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return "other";
+    }
+
+    return normalized.Length > 50 ? normalized[..50] : normalized;
+}
+
 static string ToRoleName(UserRole role) =>
     role == UserRole.Admin ? "admin" : "user";
 
@@ -1658,7 +1840,7 @@ static DateOnly AddRepeatInterval(DateOnly dueDate, TimeSpan repeatInterval)
 }
 
 static TransactionResponse ToTransactionResponse(Transaction transaction) =>
-    new(transaction.Id, transaction.AccountId, transaction.CategoryId, transaction.RecurringPaymentId, transaction.Amount,
+    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.RecurringPaymentId, transaction.Amount,
         transaction.Description, transaction.TransactionDate);
 
 static BudgetResponse ToBudgetResponse(Budget budget) =>
@@ -1725,6 +1907,28 @@ static async Task EnsureUserCategoryPreferenceTableAsync(IServiceProvider servic
         );
         CREATE INDEX IF NOT EXISTS idx_user_category_preferences_user_id
             ON user_category_preferences(user_id);
+    """);
+}
+
+static async Task EnsureCategoryIconKeysAsync(IServiceProvider services)
+{
+    using var scope = services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    if (!db.Database.IsRelational())
+    {
+        return;
+    }
+
+    await db.Database.ExecuteSqlRawAsync("""
+        ALTER TABLE categories
+            ALTER COLUMN icon_key SET DEFAULT 'other';
+
+        UPDATE categories
+        SET icon_key = CASE
+            WHEN type = 'income'::category_type THEN 'income'
+            ELSE 'other'
+        END
+        WHERE icon_key IS NULL OR btrim(icon_key) = '';
     """);
 }
 

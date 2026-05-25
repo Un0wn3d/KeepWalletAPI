@@ -12,4 +12,5 @@ public class Transaction
     public DateTimeOffset TransactionDate { get; set; }
 
     public BankAccount? Account { get; set; }
+    public Group? Group { get; set; }
 }
