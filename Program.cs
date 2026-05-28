@@ -194,7 +194,8 @@ app.MapGet("/api/categories", async (ClaimsPrincipal principal, AppDbContext db,
             x.Category.Id,
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
-            x.Category.IconKey ?? (x.Category.Type == CategoryType.Income ? "income" : "other")))
+            x.Category.IconKey ?? (x.Category.Type == CategoryType.Income ? "income" : "other"),
+            x.Category.Color))
         .ToListAsync(ct);
 
     return Results.Ok(categories);
@@ -224,14 +225,16 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
             existing.Id,
             existing.Name,
             existing.Type == CategoryType.Income ? "income" : "expense",
-            NormalizeIconKey(existing.IconKey, existing.Type)));
+            NormalizeIconKey(existing.IconKey, existing.Type),
+            existing.Color));
     }
 
     var category = new Category
     {
         Name = name,
         Type = type.Value,
-        IconKey = NormalizeIconKey(request.IconKey, type.Value)
+        IconKey = NormalizeIconKey(request.IconKey, type.Value),
+        Color = NormalizeHexColor(request.Color)
     };
 
     db.Categories.Add(category);
@@ -241,7 +244,8 @@ app.MapPost("/api/categories", async (CreateCategoryRequest request, AppDbContex
         category.Id,
         category.Name,
         category.Type == CategoryType.Income ? "income" : "expense",
-        NormalizeIconKey(category.IconKey, category.Type)));
+        NormalizeIconKey(category.IconKey, category.Type),
+        category.Color));
 }).RequireAuthorization();
 
 app.MapPatch("/api/categories/{categoryId:int}", async (
@@ -262,13 +266,18 @@ app.MapPatch("/api/categories/{categoryId:int}", async (
     {
         category.IconKey = NormalizeIconKey(request.IconKey, category.Type);
     }
+    if (request.Color is not null)
+    {
+        category.Color = NormalizeHexColor(request.Color);
+    }
 
     await db.SaveChangesAsync(ct);
     return Results.Ok(new CategoryResponse(
         category.Id,
         category.Name,
         category.Type == CategoryType.Income ? "income" : "expense",
-        NormalizeIconKey(category.IconKey, category.Type)));
+        NormalizeIconKey(category.IconKey, category.Type),
+        category.Color));
 }).RequireAuthorization();
 
 app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -309,6 +318,7 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
             x.Category.Name,
             x.Category.Type == CategoryType.Income ? "income" : "expense",
             x.Category.IconKey ?? (x.Category.Type == CategoryType.Income ? "income" : "other"),
+            x.Category.Color,
             !hasSavedPreferences || selectedIdSet.Contains(x.Category.Id)))
         .ToListAsync(ct);
 
@@ -448,7 +458,8 @@ app.MapPost("/api/categories/{sourceCategoryId:int}/merge", async (
         target.Id,
         target.Name,
         target.Type == CategoryType.Income ? "income" : "expense",
-        NormalizeIconKey(target.IconKey, target.Type)));
+        NormalizeIconKey(target.IconKey, target.Type),
+        target.Color));
 }).RequireAuthorization();
 
 app.MapGet("/api/budgets", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1339,7 +1350,7 @@ app.MapGet("/api/savings", async (ClaimsPrincipal principal, AppDbContext db, Ca
         .OrderBy(s => s.IsCompleted)
         .ThenBy(s => s.Deadline)
         .ThenBy(s => s.Name)
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.IsCompleted, s.CreatedAt))
+        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Currency, s.IconKey, s.Color, s.Deadline, s.IsCompleted, s.CreatedAt))
         .ToListAsync(ct);
 
     return Results.Ok(savings);
@@ -1354,7 +1365,7 @@ app.MapGet("/api/savings/{id:int}", async (int id, ClaimsPrincipal principal, Ap
         .AsNoTracking()
         .Where(s => s.Id == id && (s.UserId == userId.Value ||
             (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))))
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.IsCompleted, s.CreatedAt))
+        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Currency, s.IconKey, s.Color, s.Deadline, s.IsCompleted, s.CreatedAt))
         .FirstOrDefaultAsync(ct);
 
     return saving is null ? Results.NotFound() : Results.Ok(saving);
@@ -1371,6 +1382,9 @@ app.MapPost("/api/savings", async (CreateSavingRequest request, ClaimsPrincipal 
         Name = request.Name.Trim(),
         TargetAmount = request.TargetAmount,
         CurrentAmount = request.CurrentAmount,
+        Currency = NormalizeCurrency(request.Currency),
+        IconKey = NormalizeSavingIconKey(request.IconKey),
+        Color = NormalizeHexColor(request.Color),
         Deadline = request.Deadline,
         IsCompleted = request.TargetAmount.HasValue && request.CurrentAmount >= request.TargetAmount.Value,
         CreatedAt = DateTimeOffset.UtcNow
@@ -1393,6 +1407,9 @@ app.MapPut("/api/savings/{id:int}", async (int id, UpdateSavingRequest request, 
     saving.Name = request.Name.Trim();
     saving.TargetAmount = request.TargetAmount;
     saving.CurrentAmount = request.CurrentAmount;
+    saving.Currency = NormalizeCurrency(request.Currency);
+    saving.IconKey = NormalizeSavingIconKey(request.IconKey);
+    saving.Color = NormalizeHexColor(request.Color);
     saving.Deadline = request.Deadline;
     saving.IsCompleted = request.IsCompleted;
 
@@ -1629,6 +1646,30 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
     return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
+app.MapDelete("/api/planned-transactions/{id:int}", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var transaction = await db.Transactions
+        .Include(t => t.Account)
+        .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (transaction is null) return Results.NotFound();
+
+    var recurringPaymentId = transaction.RecurringPaymentId!.Value;
+    var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);
+
+    db.Transactions.Remove(transaction);
+    if (payment is not null)
+    {
+        db.ScheduledPayments.Remove(payment);
+    }
+
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
+}).RequireAuthorization();
+
 app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
@@ -1647,6 +1688,7 @@ app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext d
             t.Group != null ? t.Group.Name : null,
             t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
             t.CategoryId,
+            t.SavingId,
             t.RecurringPaymentId,
             t.Amount,
             t.Description,
@@ -1673,6 +1715,7 @@ app.MapGet("/api/transactions/{id:int}", async (int id, ClaimsPrincipal principa
             t.Group != null ? t.Group.Name : null,
             t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
             t.CategoryId,
+            t.SavingId,
             t.RecurringPaymentId,
             t.Amount,
             t.Description,
@@ -1697,11 +1740,19 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
         if (!canShare) return Results.NotFound();
     }
 
+    if (request.SavingId.HasValue)
+    {
+        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
+            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))), ct);
+        if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
+    }
+
     var transaction = new Transaction
     {
         AccountId = request.AccountId,
         GroupId = request.GroupId ?? transactionAccount.GroupId,
         CategoryId = request.CategoryId,
+        SavingId = request.SavingId,
         RecurringPaymentId = request.RecurringPaymentId,
         Amount = request.Amount,
         Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim(),
@@ -1734,9 +1785,17 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
         if (!canShare) return Results.NotFound();
     }
 
+    if (request.SavingId.HasValue)
+    {
+        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
+            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))), ct);
+        if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
+    }
+
     transaction.AccountId = request.AccountId;
     transaction.GroupId = request.GroupId ?? targetAccount.GroupId;
     transaction.CategoryId = request.CategoryId;
+    transaction.SavingId = request.SavingId;
     transaction.RecurringPaymentId = request.RecurringPaymentId;
     transaction.Amount = request.Amount;
     transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim();
@@ -1816,6 +1875,44 @@ static string NormalizeGroupIconKey(string? iconKey)
     return normalized.Length > 50 ? normalized[..50] : normalized;
 }
 
+static string NormalizeSavingIconKey(string? iconKey)
+{
+    var normalized = (iconKey ?? string.Empty).Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return "other";
+    }
+
+    return normalized.Length > 50 ? normalized[..50] : normalized;
+}
+
+static string NormalizeCurrency(string? currency)
+{
+    var normalized = (currency ?? "UAH").Trim().ToUpperInvariant();
+    if (normalized.Length == 0)
+    {
+        return "UAH";
+    }
+
+    return normalized.Length > 3 ? normalized[..3] : normalized;
+}
+
+static string? NormalizeHexColor(string? color)
+{
+    if (string.IsNullOrWhiteSpace(color))
+    {
+        return null;
+    }
+
+    var normalized = color.Trim().ToUpperInvariant();
+    if (!normalized.StartsWith('#'))
+    {
+        normalized = $"#{normalized}";
+    }
+
+    return normalized.Length > 10 ? normalized[..10] : normalized;
+}
+
 static string ToRoleName(UserRole role) =>
     role == UserRole.Admin ? "admin" : "user";
 
@@ -1823,7 +1920,7 @@ static BankAccountResponse ToBankAccountResponse(BankAccount account) =>
     new(account.Id, account.UserId, account.GroupId, account.Name, account.Currency, account.Balance, account.IsDefault, account.CreatedAt, account.UpdatedAt);
 
 static SavingResponse ToSavingResponse(Saving saving) =>
-    new(saving.Id, saving.UserId, saving.GroupId, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Deadline, saving.IsCompleted, saving.CreatedAt);
+    new(saving.Id, saving.UserId, saving.GroupId, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Currency, saving.IconKey, saving.Color, saving.Deadline, saving.IsCompleted, saving.CreatedAt);
 
 static SavingItemResponse ToSavingItemResponse(SavingItem item) =>
     new(item.Id, item.SavingId, item.Name, item.Price, item.Priority, item.IsPurchased);
@@ -1840,7 +1937,7 @@ static DateOnly AddRepeatInterval(DateOnly dueDate, TimeSpan repeatInterval)
 }
 
 static TransactionResponse ToTransactionResponse(Transaction transaction) =>
-    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.RecurringPaymentId, transaction.Amount,
+    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.SavingId, transaction.RecurringPaymentId, transaction.Amount,
         transaction.Description, transaction.TransactionDate);
 
 static BudgetResponse ToBudgetResponse(Budget budget) =>

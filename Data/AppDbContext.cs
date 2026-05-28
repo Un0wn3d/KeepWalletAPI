@@ -86,6 +86,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.AccountId).HasColumnName("account_id");
             entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.CategoryId).HasColumnName("category_id");
+            entity.Property(x => x.SavingId).HasColumnName("saving_id");
             entity.Property(x => x.RecurringPaymentId).HasColumnName("recurring_payments_id");
             entity.Property(x => x.Amount).HasColumnName("amount").HasColumnType("numeric(15,2)");
             entity.Property(x => x.Description).HasColumnName("description").HasMaxLength(500);
@@ -101,8 +102,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasForeignKey(x => x.GroupId)
                 .OnDelete(DeleteBehavior.SetNull);
 
+            entity.HasOne(x => x.Saving)
+                .WithMany()
+                .HasForeignKey(x => x.SavingId)
+                .OnDelete(DeleteBehavior.SetNull);
+
             entity.HasIndex(x => new { x.AccountId, x.TransactionDate }).HasDatabaseName("idx_transactions_account_date");
             entity.HasIndex(x => new { x.AccountId, x.CategoryId }).HasDatabaseName("idx_transactions_account_type");
+            entity.HasIndex(x => x.SavingId).HasDatabaseName("idx_transactions_saving_id");
         });
 
         modelBuilder.Entity<BankAccount>(entity =>
@@ -146,6 +153,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
             entity.Property(x => x.TargetAmount).HasColumnName("target_amount").HasColumnType("numeric(15,2)");
             entity.Property(x => x.CurrentAmount).HasColumnName("current_amount").HasColumnType("numeric(15,2)");
+            entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).HasDefaultValue("UAH").IsRequired();
+            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
+            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
             entity.Property(x => x.Deadline).HasColumnName("deadline");
             entity.Property(x => x.IsCompleted).HasColumnName("is_completed").HasDefaultValue(false);
             entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
@@ -200,6 +210,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
             entity.Property(x => x.Type).HasColumnName("type").HasColumnType("category_type");
             entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50).HasDefaultValue("other");
+            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
         });
 
         modelBuilder.Entity<PopularCategoryLast30Days>(entity =>

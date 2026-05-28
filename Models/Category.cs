@@ -17,4 +17,5 @@ public class Category
     public string Name { get; set; } = string.Empty;
     public CategoryType Type { get; set; }
     public string? IconKey { get; set; } = "other";
+    public string? Color { get; set; }
 }

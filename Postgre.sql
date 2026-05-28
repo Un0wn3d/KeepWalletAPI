@@ -1,4 +1,4 @@
--- 1. КОРИСТУВАЧІ ТА РОЛІ
+﻿-- 1. КОРИСТУВАЧІ ТА РОЛІ
 CREATE TYPE user_role AS ENUM ('admin', 'user');
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- для gen_random_uuid()
 
@@ -41,7 +41,7 @@ CREATE TABLE accounts (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id     UUID  REFERENCES groups(id) ON DELETE SET NULL,
-    name         VARCHAR(100) NOT NULL, -- 'Основний', 'Готівка', 'Карта Mono'
+    name         VARCHAR(100) NOT NULL, -- e.g. 'Main', 'Cash', 'Mono Card'
     currency     VARCHAR(3) NOT NULL DEFAULT 'UAH', -- ISO 4217
     balance      NUMERIC(15,2) DEFAULT 0.00,
     is_default   BOOLEAN DEFAULT FALSE,
@@ -55,11 +55,12 @@ CREATE TYPE category_type AS ENUM ('income', 'expense');
 CREATE TABLE categories (
     id          SERIAL PRIMARY KEY,
     icon_key    VARCHAR(50),
+    color       VARCHAR(10),
     name        VARCHAR(100) NOT NULL,
     type        category_type NOT NULL
 );
 
--- Системні категорії (загальні для всіх)
+INSERT INTO categories (name, type) VALUES
 INSERT INTO categories (name, type) VALUES
     ('Їжа',                   'expense'),
     ('Транспорт',             'expense'),
@@ -104,6 +105,7 @@ CREATE TABLE transactions (
     account_id       UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     group_id         UUID REFERENCES groups(id) ON DELETE SET NULL,
     category_id      INT NOT NULL REFERENCES categories(id),
+    saving_id        INT,
     recurring_payments_id INT REFERENCES recurring_payments(id) ON DELETE SET NULL,
     amount           NUMERIC(15,2) CHECK (amount > 0),
     description      VARCHAR(500),
@@ -111,6 +113,7 @@ CREATE TABLE transactions (
 );
 CREATE INDEX idx_transactions_account_date ON transactions(account_id, transaction_date DESC);
 CREATE INDEX idx_transactions_account_type ON transactions(account_id, category_id);
+CREATE INDEX idx_transactions_saving_id ON transactions(saving_id);
 
 -- 6. СКАРБНИЧКИ, ВІДСОТКИ, СПИСОК БАЖАНОГО
 CREATE TABLE savings (
@@ -118,6 +121,9 @@ CREATE TABLE savings (
     user_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id       UUID REFERENCES groups(id) ON DELETE SET NULL,
     name           VARCHAR(200) NOT NULL,
+    currency       VARCHAR(3) NOT NULL DEFAULT 'UAH', -- ISO 4217
+    icon_key       VARCHAR(50),
+    color          VARCHAR(10),
     target_amount  NUMERIC(15,2) CHECK (target_amount > 0),
     current_amount NUMERIC(15,2) DEFAULT 0.00 CHECK (current_amount >= 0),
     deadline       DATE,
@@ -126,6 +132,7 @@ CREATE TABLE savings (
 );
 CREATE INDEX idx_savings_user_id ON savings(user_id);
 CREATE INDEX idx_savings_user_completed ON savings(user_id, is_completed);
+ALTER TABLE transactions ADD CONSTRAINT fk_transactions_saving_id FOREIGN KEY (saving_id) REFERENCES savings(id) ON DELETE SET NULL;
 
 CREATE TABLE wish_list (
     id             SERIAL PRIMARY KEY,
@@ -143,7 +150,7 @@ CREATE TABLE logs (
     user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
     action      VARCHAR(100) NOT NULL,   -- 'LOGIN', 'CREATE_TRANSACTION', 'DELETE_SAVING', ...
     entity_type VARCHAR(100),            -- 'transaction', 'saving', 'piggy_bank', ...
-    details     JSONB,                    -- JSON-рядок із деталями дії
+    details     JSONB,                    -- JSON details
     device      VARCHAR(45),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
