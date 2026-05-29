@@ -1,0 +1,44 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+COPY KeepWalletAPI.csproj ./
+RUN dotnet restore KeepWalletAPI.csproj
+
+COPY . ./
+RUN dotnet publish KeepWalletAPI.csproj -c Release -o /app/publish --no-restore
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql postgresql-contrib gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Development \
+    POSTGRES_DB=KeepWallet \
+    POSTGRES_USER=KeepWallet \
+    POSTGRES_PASSWORD=KeepWallet \
+    POSTGRES_PORT=5432 \
+    API_PORT=8080 \
+    JWT_ISSUER=KeepWalletAPI \
+    JWT_AUDIENCE=KeepWalletClient \
+    JWT_KEY=replace-this-with-a-long-random-secret-key-min-32-chars \
+    AUTH_USE_SECURE_COOKIES=false \
+    PGDATA=/var/lib/postgresql/data
+
+WORKDIR /app
+
+COPY --from=build /app/publish/ ./
+COPY docker/all-in-one-entrypoint.sh /usr/local/bin/all-in-one-entrypoint.sh
+COPY docker/initdb/ /docker-entrypoint-initdb.d/
+
+RUN chmod +x /usr/local/bin/all-in-one-entrypoint.sh \
+    && mkdir -p /var/lib/postgresql /run/postgresql /docker-entrypoint-initdb.d \
+    && chown -R postgres:postgres /var/lib/postgresql /run/postgresql
+
+VOLUME ["/var/lib/postgresql/data"]
+
+EXPOSE 8080 5432
+
+ENTRYPOINT ["/usr/local/bin/all-in-one-entrypoint.sh"]

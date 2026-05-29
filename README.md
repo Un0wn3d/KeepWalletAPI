@@ -64,6 +64,36 @@ dotnet run --project KeepWalletAPI
 5. Open OpenAPI in development:
 - `GET /openapi/v1.json`
 
+## Single-Container Docker Run
+
+For a single ready-to-run container with both the API and PostgreSQL inside it:
+
+1. Open the `KeepWalletAPI` folder and build there:
+
+```bash
+docker build -f Dockerfile.api-db -t keepwallet-api-db .
+```
+
+2. Run it:
+
+```bash
+docker run --name keepwallet-api-db \
+  -p 5174:8080 \
+  -p 5432:5432 \
+  -e POSTGRES_PASSWORD=change-me \
+  -e JWT_KEY=change-this-to-a-long-random-secret-key-min-32-chars \
+  -v keepwallet_pgdata:/var/lib/postgresql/data \
+  keepwallet-api-db
+```
+
+3. API will be available at:
+- `http://localhost:5174`
+
+Notes:
+- The container initializes PostgreSQL automatically on first start.
+- Database files are stored in `/var/lib/postgresql/data`.
+- You can override `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `API_PORT`, `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_KEY`.
+
 ## Security Baseline
 
 - Passwords are never stored in plain text.
