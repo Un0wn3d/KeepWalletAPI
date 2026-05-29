@@ -19,10 +19,31 @@ mkdir -p "${PGDATA}" /run/postgresql
 chown -R postgres:postgres "${PGDATA}" /run/postgresql
 chmod 700 "${PGDATA}"
 
-postgres_bin="$(command -v postgres)"
-pg_ctl_bin="$(command -v pg_ctl)"
-initdb_bin="$(command -v initdb)"
-psql_bin="$(command -v psql)"
+find_pg_bin() {
+    local name="$1"
+
+    if command -v "${name}" >/dev/null 2>&1; then
+        command -v "${name}"
+        return 0
+    fi
+
+    local candidate
+    candidate="$(find /usr/lib/postgresql -type f -name "${name}" 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "${candidate}" ]]; then
+        echo "${candidate}"
+        return 0
+    fi
+
+    echo "Required PostgreSQL binary '${name}' was not found." >&2
+    return 1
+}
+
+postgres_bin="$(find_pg_bin postgres)"
+pg_ctl_bin="$(find_pg_bin pg_ctl)"
+initdb_bin="$(find_pg_bin initdb)"
+psql_bin="$(find_pg_bin psql)"
+
+echo "Using PostgreSQL binaries from $(dirname "${postgres_bin}")"
 
 wait_for_postgres() {
     local attempt
@@ -68,6 +89,7 @@ cleanup() {
 trap cleanup EXIT SIGINT SIGTERM
 
 if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
+    echo "Initializing PostgreSQL data directory at ${PGDATA}"
     gosu postgres "${initdb_bin}" -D "${PGDATA}" >/dev/null
     start_postgres_bg
 
@@ -95,8 +117,10 @@ SQL
     POSTGRES_PID=""
 fi
 
+echo "Starting PostgreSQL on port ${POSTGRES_PORT}"
 start_postgres_bg
 
+echo "Starting KeepWallet API on port ${API_PORT}"
 dotnet /app/KeepWalletAPI.dll &
 APP_PID=$!
 
