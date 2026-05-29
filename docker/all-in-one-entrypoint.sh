@@ -109,9 +109,11 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}')
 \gexec
 SQL
 
+    export PGPASSWORD="${POSTGRES_PASSWORD}"
     for sql_file in /docker-entrypoint-initdb.d/*.sql; do
-        gosu postgres "${psql_bin}" -v ON_ERROR_STOP=1 -p "${POSTGRES_PORT}" -U postgres -d "${POSTGRES_DB}" -f "${sql_file}"
+        gosu postgres "${psql_bin}" -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -f "${sql_file}"
     done
+    unset PGPASSWORD
 
     stop_postgres
     POSTGRES_PID=""
