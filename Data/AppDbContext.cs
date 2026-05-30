@@ -197,7 +197,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
             entity.Property(x => x.RepeatInterval).HasColumnName("repeat_interval");
-            entity.Property(x => x.NextDueDate).HasColumnName("next_due_date");
+            entity.Property(x => x.NextDueDate).HasColumnName("next_due_date").HasColumnType("timestamp with time zone");
             entity.Property(x => x.IsActive).HasColumnName("is_active").HasDefaultValue(true);
         });
 

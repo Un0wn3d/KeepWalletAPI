@@ -87,7 +87,7 @@ CREATE TABLE recurring_payments (
     id SERIAL PRIMARY KEY,
     name VARCHAR(200) NOT NULL,
     repeat_interval INTERVAL NOT NULL,
-    next_due_date DATE NOT NULL,
+    next_due_date TIMESTAMPTZ NOT NULL,
     is_active BOOLEAN DEFAULT TRUE
 );
 

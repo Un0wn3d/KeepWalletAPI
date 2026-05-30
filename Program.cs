@@ -109,6 +109,7 @@ var app = builder.Build();
 await EnsureUserCategoryPreferenceTableAsync(app.Services);
 await EnsureCategoryIconKeysAsync(app.Services);
 await EnsureGroupMembershipSchemaAsync(app.Services);
+await EnsureScheduledPaymentDueDateSchemaAsync(app.Services);
 await EnsureTransactionBalanceTriggersAsync(app.Services);
 
 if (app.Environment.IsDevelopment())
@@ -1577,7 +1578,7 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
     {
         Name = request.Name.Trim(),
         RepeatInterval = request.RepeatInterval,
-        NextDueDate = request.NextDueDate,
+        NextDueDate = request.NextDueDate.ToUniversalTime(),
         IsActive = true
     };
 
@@ -1592,12 +1593,49 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
         RecurringPaymentId = payment.Id,
         Amount = request.Amount,
         Description = string.IsNullOrWhiteSpace(request.Description) ? request.Name.Trim() : request.Description.Trim(),
-        TransactionDate = new DateTimeOffset(request.NextDueDate.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)
+        TransactionDate = payment.NextDueDate
     };
 
     db.Transactions.Add(transaction);
     await db.SaveChangesAsync(ct);
     return Results.Created($"/api/planned-transactions/{transaction.Id}", ToTransactionResponse(transaction));
+}).RequireAuthorization();
+
+app.MapPut("/api/planned-transactions/{id:int}", async (int id, CreatePlannedTransactionRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var transaction = await db.Transactions
+        .Include(t => t.Account)
+        .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))), ct);
+    if (transaction is null) return Results.NotFound();
+
+    var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == transaction.RecurringPaymentId!.Value, ct);
+    if (payment is null) return Results.NotFound();
+
+    var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
+        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (account is null) return Results.BadRequest(new { message = "Account does not exist." });
+
+    var hasCategory = await db.Categories.AnyAsync(c => c.Id == request.CategoryId, ct);
+    if (!hasCategory) return Results.BadRequest(new { message = "Category does not exist." });
+
+    var nextDueDate = request.NextDueDate.ToUniversalTime();
+    payment.Name = request.Name.Trim();
+    payment.RepeatInterval = request.RepeatInterval;
+    payment.NextDueDate = nextDueDate;
+
+    transaction.AccountId = request.AccountId;
+    transaction.GroupId = account.GroupId;
+    transaction.CategoryId = request.CategoryId;
+    transaction.Amount = request.Amount;
+    transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? request.Name.Trim() : request.Description.Trim();
+    transaction.TransactionDate = nextDueDate;
+
+    await db.SaveChangesAsync(ct);
+    return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
 app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1632,7 +1670,7 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
             RecurringPaymentId = payment.Id,
             Amount = transaction.Amount,
             Description = transaction.Description,
-            TransactionDate = new DateTimeOffset(payment.NextDueDate.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)
+            TransactionDate = payment.NextDueDate
         });
     }
     else
@@ -1925,14 +1963,13 @@ static SavingResponse ToSavingResponse(Saving saving) =>
 static SavingItemResponse ToSavingItemResponse(SavingItem item) =>
     new(item.Id, item.SavingId, item.Name, item.Price, item.Priority, item.IsPurchased);
 
-static DateOnly AddRepeatInterval(DateOnly dueDate, TimeSpan repeatInterval)
+static DateTimeOffset AddRepeatInterval(DateTimeOffset dueDate, TimeSpan repeatInterval)
 {
-    var date = dueDate.ToDateTime(TimeOnly.MinValue);
     return repeatInterval.TotalDays switch
     {
-        >= 28 and <= 31 => DateOnly.FromDateTime(date.AddMonths(1)),
-        >= 365 and <= 366 => DateOnly.FromDateTime(date.AddYears(1)),
-        _ => DateOnly.FromDateTime(date.Add(repeatInterval))
+        >= 28 and <= 31 => dueDate.AddMonths(1),
+        >= 365 and <= 366 => dueDate.AddYears(1),
+        _ => dueDate.Add(repeatInterval)
     };
 }
 
@@ -2039,8 +2076,8 @@ static async Task EnsureGroupMembershipSchemaAsync(IServiceProvider services)
     }
 
     await db.Database.ExecuteSqlRawAsync("""
-    DO $$
-    BEGIN
+        DO $$
+        BEGIN
         IF EXISTS (
             SELECT 1
             FROM information_schema.table_constraints
@@ -2060,8 +2097,25 @@ static async Task EnsureGroupMembershipSchemaAsync(IServiceProvider services)
         END IF;
 
         CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
-    END $$;
-    """);
+        END $$;
+        """);
+}
+
+static async Task EnsureScheduledPaymentDueDateSchemaAsync(IServiceProvider services)
+{
+    await using var scope = services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+    if (!db.Database.IsRelational())
+    {
+        return;
+    }
+
+    await db.Database.ExecuteSqlRawAsync("""
+        ALTER TABLE recurring_payments
+        ALTER COLUMN next_due_date TYPE TIMESTAMPTZ
+        USING next_due_date::timestamp AT TIME ZONE 'UTC';
+        """);
 }
 
 static async Task EnsureTransactionBalanceTriggersAsync(IServiceProvider services)

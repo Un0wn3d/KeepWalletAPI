@@ -44,7 +44,7 @@ public record CreatePlannedTransactionRequest(
     [Required, StringLength(200)] string Name,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
     [StringLength(500)] string? Description,
-    DateOnly NextDueDate,
+    DateTimeOffset NextDueDate,
     TimeSpan RepeatInterval
 );
 
@@ -58,6 +58,6 @@ public record PlannedTransactionResponse(
     string? Description,
     DateTimeOffset TransactionDate,
     TimeSpan RepeatInterval,
-    DateOnly NextDueDate,
+    DateTimeOffset NextDueDate,
     bool IsActive
 );
