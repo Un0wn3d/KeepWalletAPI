@@ -1638,7 +1638,7 @@ app.MapPut("/api/planned-transactions/{id:int}", async (int id, CreatePlannedTra
     return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
-app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ConfirmPlannedTransactionRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
@@ -1648,6 +1648,17 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
         .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
             (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transaction is null) return Results.NotFound();
+
+    var selectedAccount = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
+        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (selectedAccount is null) return Results.BadRequest(new { message = "Account does not exist." });
+    if (!string.Equals(selectedAccount.Currency, transaction.Account!.Currency, StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new { message = "Account currency does not match planned transaction currency." });
+    }
+
+    transaction.AccountId = selectedAccount.Id;
+    transaction.GroupId = selectedAccount.GroupId;
 
     var recurringPaymentId = transaction.RecurringPaymentId!.Value;
     var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);

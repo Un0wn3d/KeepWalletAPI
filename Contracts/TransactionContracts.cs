@@ -61,3 +61,5 @@ public record PlannedTransactionResponse(
     DateTimeOffset NextDueDate,
     bool IsActive
 );
+
+public record ConfirmPlannedTransactionRequest(Guid AccountId);
