@@ -6,6 +6,9 @@ public class Saving
     public Guid UserId { get; set; }
     public Guid? GroupId { get; set; }
     public string Name { get; set; } = string.Empty;
+    public string Currency { get; set; } = "UAH";
+    public string? IconKey { get; set; }
+    public string? Color { get; set; }
     public decimal? TargetAmount { get; set; }
     public decimal CurrentAmount { get; set; }
     public DateOnly? Deadline { get; set; }

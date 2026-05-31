@@ -272,7 +272,8 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
         .AsNoTracking()
         .Where(x => x.UserId == userId.Value)
         .ToListAsync(ct);
-    var selectedIds = preferences
+    var activeIds = preferences
+        .Where(x => x.IsActive)
         .Select(x => x.CategoryId)
         .ToList();
     var preferenceIconKeys = preferences
@@ -282,8 +283,8 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
         .Where(x => !string.IsNullOrWhiteSpace(x.Color))
         .ToDictionary(x => x.CategoryId, x => x.Color);
 
-    var selectedIdSet = selectedIds.ToHashSet();
-    var hasSavedPreferences = selectedIdSet.Count > 0;
+    var activeIdSet = activeIds.ToHashSet();
+    var hasSavedPreferences = preferences.Count > 0;
 
     var popular = db.PopularCategoriesLast30Days
         .AsNoTracking()
@@ -317,7 +318,7 @@ app.MapGet("/api/user-categories", async (ClaimsPrincipal principal, AppDbContex
             preferenceColors.TryGetValue(x.Category.Id, out var color)
                 ? color
                 : null,
-            !hasSavedPreferences || selectedIdSet.Contains(x.Category.Id)))
+            !hasSavedPreferences || activeIdSet.Contains(x.Category.Id)))
         .ToList();
 
     return Results.Ok(categories);
@@ -327,6 +328,7 @@ app.MapPut("/api/user-categories", async (
     UpdateUserCategoryPreferencesRequest request,
     ClaimsPrincipal principal,
     AppDbContext db,
+    ILogger<Program> log,
     CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
@@ -336,32 +338,76 @@ app.MapPut("/api/user-categories", async (
         .Distinct()
         .ToHashSet();
 
-    var existing = await db.UserCategoryPreferences
-        .Where(x => x.UserId == userId.Value)
-        .ToListAsync(ct);
-
-    db.UserCategoryPreferences.RemoveRange(existing);
-
     var preferenceById = request.Preferences?
         .GroupBy(x => x.CategoryId)
         .ToDictionary(x => x.Key, x => x.Last()) ?? [];
 
+    log.LogInformation(
+        "Updating category preferences: UserId={UserId}, SelectedCount={SelectedCount}, PreferencesCount={PreferencesCount}",
+        userId.Value,
+        selectedIds.Count,
+        preferenceById.Count);
+
+    var requestedCategoryIds = preferenceById.Count > 0
+        ? selectedIds.Concat(preferenceById.Keys).Distinct().ToHashSet()
+        : selectedIds;
+
     var validCategories = await db.Categories
-        .Where(c => selectedIds.Contains(c.Id))
+        .Where(c => requestedCategoryIds.Contains(c.Id))
         .Select(c => new { c.Id, c.Type })
         .ToListAsync(ct);
 
-    db.UserCategoryPreferences.AddRange(validCategories.Select(category =>
+    var validCategoryIds = validCategories.Select(x => x.Id).ToHashSet();
+    if (preferenceById.Count == 0)
+    {
+        await db.UserCategoryPreferences
+            .Where(x => x.UserId == userId.Value && !validCategoryIds.Contains(x.CategoryId))
+            .ExecuteDeleteAsync(ct);
+    }
+
+    foreach (var category in validCategories)
     {
         preferenceById.TryGetValue(category.Id, out var preference);
-        return new UserCategoryPreference
+        var iconKey = NormalizeIconKey(preference?.IconKey, category.Type);
+        var color = string.IsNullOrWhiteSpace(preference?.Color) ? null : preference.Color;
+        var isActive = preference?.IsActive ?? selectedIds.Contains(category.Id);
+
+        var updated = await db.UserCategoryPreferences
+            .Where(x => x.UserId == userId.Value && x.CategoryId == category.Id)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.IconKey, iconKey)
+                .SetProperty(x => x.Color, color)
+                .SetProperty(x => x.IsActive, isActive), ct);
+
+        if (updated > 0)
+        {
+            log.LogInformation(
+                "Updated category preference: UserId={UserId}, CategoryId={CategoryId}, IconKey={IconKey}, Color={Color}, IsActive={IsActive}, Rows={Rows}",
+                userId.Value,
+                category.Id,
+                iconKey,
+                color,
+                isActive,
+                updated);
+            continue;
+        }
+
+        db.UserCategoryPreferences.Add(new UserCategoryPreference
         {
             UserId = userId.Value,
             CategoryId = category.Id,
-            IconKey = NormalizeIconKey(preference?.IconKey, category.Type),
-            Color = string.IsNullOrWhiteSpace(preference?.Color) ? null : preference.Color
-        };
-    }));
+            IconKey = iconKey,
+            Color = color,
+            IsActive = isActive
+        });
+        log.LogInformation(
+            "Inserted category preference: UserId={UserId}, CategoryId={CategoryId}, IconKey={IconKey}, Color={Color}, IsActive={IsActive}",
+            userId.Value,
+            category.Id,
+            iconKey,
+            color,
+            isActive);
+    }
 
     await db.SaveChangesAsync(ct);
     return Results.NoContent();
@@ -1349,7 +1395,7 @@ app.MapGet("/api/savings", async (ClaimsPrincipal principal, AppDbContext db, Ca
         .OrderBy(s => s.IsCompleted)
         .ThenBy(s => s.Deadline)
         .ThenBy(s => s.Name)
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.IsCompleted))
+        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.Currency, s.IconKey, s.Color, s.IsCompleted))
         .ToListAsync(ct);
 
     return Results.Ok(savings);
@@ -1364,7 +1410,7 @@ app.MapGet("/api/savings/{id:int}", async (int id, ClaimsPrincipal principal, Ap
         .AsNoTracking()
         .Where(s => s.Id == id && (s.UserId == userId.Value ||
             (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))))
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.IsCompleted))
+        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.Currency, s.IconKey, s.Color, s.IsCompleted))
         .FirstOrDefaultAsync(ct);
 
     return saving is null ? Results.NotFound() : Results.Ok(saving);
@@ -1379,6 +1425,9 @@ app.MapPost("/api/savings", async (CreateSavingRequest request, ClaimsPrincipal 
     {
         UserId = userId.Value,
         Name = request.Name.Trim(),
+        Currency = NormalizeCurrency(request.Currency),
+        IconKey = NormalizeSavingIconKey(request.IconKey),
+        Color = NormalizeColor(request.Color),
         TargetAmount = request.TargetAmount,
         CurrentAmount = request.CurrentAmount,
         Deadline = request.Deadline,
@@ -1400,6 +1449,9 @@ app.MapPut("/api/savings/{id:int}", async (int id, UpdateSavingRequest request, 
     if (saving is null) return Results.NotFound();
 
     saving.Name = request.Name.Trim();
+    saving.Currency = NormalizeCurrency(request.Currency);
+    saving.IconKey = NormalizeSavingIconKey(request.IconKey);
+    saving.Color = NormalizeColor(request.Color);
     saving.TargetAmount = request.TargetAmount;
     saving.CurrentAmount = request.CurrentAmount;
     saving.Deadline = request.Deadline;
@@ -1527,7 +1579,7 @@ app.MapGet("/api/planned-transactions", async (ClaimsPrincipal principal, AppDbC
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var transactions = await db.Transactions
+    var transactionRows = await db.Transactions
         .AsNoTracking()
         .Where(t => t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
             (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
@@ -1535,19 +1587,36 @@ app.MapGet("/api/planned-transactions", async (ClaimsPrincipal principal, AppDbC
         .Join(db.ScheduledPayments,
             t => t.RecurringPaymentId!.Value,
             p => p.Id,
-            (t, p) => new PlannedTransactionResponse(
+            (t, p) => new
+            {
                 t.Id,
                 t.AccountId,
                 t.CategoryId,
-                p.Id,
+                RecurringPaymentId = p.Id,
                 p.Name,
                 t.Amount,
                 t.Description,
                 t.TransactionDate,
                 p.RepeatInterval,
                 p.NextDueDate,
-                p.IsActive))
+                p.IsActive
+            })
         .ToListAsync(ct);
+
+    var transactions = transactionRows
+        .Select(x => new PlannedTransactionResponse(
+            x.Id,
+            x.AccountId,
+            x.CategoryId,
+            x.RecurringPaymentId,
+            x.Name,
+            x.Amount,
+            x.Description,
+            x.TransactionDate,
+            x.RepeatInterval,
+            ToDateOnly(x.NextDueDate),
+            x.IsActive))
+        .ToList();
 
     return Results.Ok(transactions);
 }).RequireAuthorization();
@@ -1569,7 +1638,7 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
     {
         Name = request.Name.Trim(),
         RepeatInterval = request.RepeatInterval,
-        NextDueDate = request.NextDueDate,
+        NextDueDate = ToUtcDateTimeOffset(request.NextDueDate),
         IsActive = true
     };
 
@@ -1590,6 +1659,44 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
     db.Transactions.Add(transaction);
     await db.SaveChangesAsync(ct);
     return Results.Created($"/api/planned-transactions/{transaction.Id}", ToTransactionResponse(transaction));
+}).RequireAuthorization();
+
+app.MapPut("/api/planned-transactions/{id:int}", async (int id, CreatePlannedTransactionRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var transaction = await db.Transactions
+        .Include(t => t.Account)
+        .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (transaction is null) return Results.NotFound();
+
+    var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
+        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (account is null) return Results.BadRequest(new { message = "Account does not exist." });
+
+    var hasCategory = await db.Categories.AnyAsync(c => c.Id == request.CategoryId, ct);
+    if (!hasCategory) return Results.BadRequest(new { message = "Category does not exist." });
+
+    var recurringPaymentId = transaction.RecurringPaymentId!.Value;
+    var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);
+    if (payment is null) return Results.NotFound();
+
+    payment.Name = request.Name.Trim();
+    payment.RepeatInterval = request.RepeatInterval;
+    payment.NextDueDate = ToUtcDateTimeOffset(request.NextDueDate);
+    payment.IsActive = true;
+
+    transaction.AccountId = request.AccountId;
+    transaction.GroupId = account.GroupId;
+    transaction.CategoryId = request.CategoryId;
+    transaction.Amount = request.Amount;
+    transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? request.Name.Trim() : request.Description.Trim();
+    transaction.TransactionDate = ToUtcDateTimeOffset(request.NextDueDate);
+
+    await db.SaveChangesAsync(ct);
+    return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
 app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1615,7 +1722,8 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
 
     if (payment.RepeatInterval > TimeSpan.Zero)
     {
-        payment.NextDueDate = AddRepeatInterval(payment.NextDueDate, payment.RepeatInterval);
+        var nextDueDate = AddRepeatInterval(ToDateOnly(payment.NextDueDate), payment.RepeatInterval);
+        payment.NextDueDate = ToUtcDateTimeOffset(nextDueDate);
         db.Transactions.Add(new Transaction
         {
             AccountId = transaction.AccountId,
@@ -1624,7 +1732,7 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
             RecurringPaymentId = payment.Id,
             Amount = transaction.Amount,
             Description = transaction.Description,
-            TransactionDate = new DateTimeOffset(payment.NextDueDate.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)
+            TransactionDate = ToUtcDateTimeOffset(nextDueDate)
         });
     }
     else
@@ -1636,6 +1744,35 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
     transaction.TransactionDate = DateTimeOffset.UtcNow;
     await db.SaveChangesAsync(ct);
     return Results.Ok(ToTransactionResponse(transaction));
+}).RequireAuthorization();
+
+app.MapDelete("/api/planned-transactions/{id:int}", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var transaction = await db.Transactions
+        .Include(t => t.Account)
+        .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
+            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    if (transaction is null) return Results.NotFound();
+
+    var recurringPaymentId = transaction.RecurringPaymentId!.Value;
+    db.Transactions.Remove(transaction);
+
+    var hasOtherPlannedTransactions = await db.Transactions
+        .AnyAsync(t => t.Id != id && t.RecurringPaymentId == recurringPaymentId, ct);
+    if (!hasOtherPlannedTransactions)
+    {
+        var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);
+        if (payment is not null)
+        {
+            db.ScheduledPayments.Remove(payment);
+        }
+    }
+
+    await db.SaveChangesAsync(ct);
+    return Results.NoContent();
 }).RequireAuthorization();
 
 app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1656,6 +1793,7 @@ app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext d
             t.Group != null ? t.Group.Name : null,
             t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
             t.CategoryId,
+            t.SavingId,
             t.RecurringPaymentId,
             t.Amount,
             t.Description,
@@ -1682,6 +1820,7 @@ app.MapGet("/api/transactions/{id:int}", async (int id, ClaimsPrincipal principa
             t.Group != null ? t.Group.Name : null,
             t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
             t.CategoryId,
+            t.SavingId,
             t.RecurringPaymentId,
             t.Amount,
             t.Description,
@@ -1706,11 +1845,19 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
         if (!canShare) return Results.NotFound();
     }
 
+    if (request.SavingId.HasValue)
+    {
+        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
+            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
+    }
+
     var transaction = new Transaction
     {
         AccountId = request.AccountId,
         GroupId = request.GroupId ?? transactionAccount.GroupId,
         CategoryId = request.CategoryId,
+        SavingId = request.SavingId,
         RecurringPaymentId = request.RecurringPaymentId,
         Amount = request.Amount,
         Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim(),
@@ -1743,9 +1890,17 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
         if (!canShare) return Results.NotFound();
     }
 
+    if (request.SavingId.HasValue)
+    {
+        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
+            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
+    }
+
     transaction.AccountId = request.AccountId;
     transaction.GroupId = request.GroupId ?? targetAccount.GroupId;
     transaction.CategoryId = request.CategoryId;
+    transaction.SavingId = request.SavingId;
     transaction.RecurringPaymentId = request.RecurringPaymentId;
     transaction.Amount = request.Amount;
     transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim();
@@ -1825,6 +1980,31 @@ static string NormalizeGroupIconKey(string? iconKey)
     return normalized.Length > 50 ? normalized[..50] : normalized;
 }
 
+static string NormalizeSavingIconKey(string? iconKey)
+{
+    var normalized = (iconKey ?? string.Empty).Trim();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return "other";
+    }
+
+    return normalized.Length > 50 ? normalized[..50] : normalized;
+}
+
+static string NormalizeCurrency(string? currency)
+{
+    var normalized = (currency ?? "UAH").Trim().ToUpperInvariant();
+    return normalized.Length == 3 ? normalized : "UAH";
+}
+
+static string? NormalizeColor(string? color)
+{
+    var normalized = (color ?? string.Empty).Trim();
+    return string.IsNullOrWhiteSpace(normalized)
+        ? null
+        : normalized.Length > 10 ? normalized[..10] : normalized;
+}
+
 static string ToRoleName(UserRole role) =>
     role == UserRole.Admin ? "admin" : "user";
 
@@ -1832,7 +2012,7 @@ static BankAccountResponse ToBankAccountResponse(BankAccount account) =>
     new(account.Id, account.UserId, account.GroupId, account.Name, account.Currency, account.Balance, account.IsDefault);
 
 static SavingResponse ToSavingResponse(Saving saving) =>
-    new(saving.Id, saving.UserId, saving.GroupId, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Deadline, saving.IsCompleted);
+    new(saving.Id, saving.UserId, saving.GroupId, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Deadline, saving.Currency, saving.IconKey, saving.Color, saving.IsCompleted);
 
 static SavingItemResponse ToSavingItemResponse(SavingItem item) =>
     new(item.Id, item.SavingId, item.Name, item.Price, item.Priority, item.IsPurchased);
@@ -1848,8 +2028,14 @@ static DateOnly AddRepeatInterval(DateOnly dueDate, TimeSpan repeatInterval)
     };
 }
 
+static DateOnly ToDateOnly(DateTimeOffset value) =>
+    DateOnly.FromDateTime(value.UtcDateTime);
+
+static DateTimeOffset ToUtcDateTimeOffset(DateOnly value) =>
+    new(value.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+
 static TransactionResponse ToTransactionResponse(Transaction transaction) =>
-    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.RecurringPaymentId, transaction.Amount,
+    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.SavingId, transaction.RecurringPaymentId, transaction.Amount,
         transaction.Description, transaction.TransactionDate);
 
 static BudgetResponse ToBudgetResponse(Budget budget) =>

@@ -6,7 +6,10 @@ public record CreateSavingRequest(
     [Required, StringLength(200)] string Name,
     [Range(typeof(decimal), "0.01", "999999999")] decimal? TargetAmount,
     [Range(typeof(decimal), "0", "999999999")] decimal CurrentAmount,
-    DateOnly? Deadline
+    DateOnly? Deadline,
+    [StringLength(3)] string Currency = "UAH",
+    [StringLength(50)] string? IconKey = null,
+    [StringLength(10)] string? Color = null
 );
 
 public record UpdateSavingRequest(
@@ -14,7 +17,10 @@ public record UpdateSavingRequest(
     [Range(typeof(decimal), "0.01", "999999999")] decimal? TargetAmount,
     [Range(typeof(decimal), "0", "999999999")] decimal CurrentAmount,
     DateOnly? Deadline,
-    bool IsCompleted
+    bool IsCompleted,
+    [StringLength(3)] string Currency = "UAH",
+    [StringLength(50)] string? IconKey = null,
+    [StringLength(10)] string? Color = null
 );
 
 public record SavingResponse(
@@ -25,8 +31,10 @@ public record SavingResponse(
     decimal? TargetAmount,
     decimal CurrentAmount,
     DateOnly? Deadline,
-    bool IsCompleted,
-    DateTimeOffset? CreatedAt = null
+    string Currency,
+    string? IconKey,
+    string? Color,
+    bool IsCompleted
 );
 
 public record CreateSavingItemRequest(

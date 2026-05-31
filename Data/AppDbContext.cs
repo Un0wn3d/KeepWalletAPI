@@ -137,6 +137,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.UserId).HasColumnName("user_id");
             entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
+            entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).HasDefaultValue("UAH");
+            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
+            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
             entity.Property(x => x.TargetAmount).HasColumnName("target_amount").HasColumnType("numeric(15,2)");
             entity.Property(x => x.CurrentAmount).HasColumnName("current_amount").HasColumnType("numeric(15,2)");
             entity.Property(x => x.Deadline).HasColumnName("deadline");
@@ -215,6 +218,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.CategoryId).HasColumnName("category_id");
             entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
             entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
+            entity.Property(x => x.IsActive).HasColumnName("is_active").HasDefaultValue(true);
 
             entity.HasOne(x => x.User)
                 .WithMany()

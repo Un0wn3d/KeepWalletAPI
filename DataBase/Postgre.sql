@@ -57,7 +57,8 @@ CREATE TABLE user_category_preferences (
     user_id UUID REFERENCES users(id),
     category_id INT REFERENCES categories(id),
     icon_key    VARCHAR(50),
-    color       VARCHAR(10)
+    color       VARCHAR(10),
+    is_active   BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE budgets (

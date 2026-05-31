@@ -6,6 +6,7 @@ public class UserCategoryPreference
     public int CategoryId { get; set; }
     public string? IconKey { get; set; }
     public string? Color { get; set; }
+    public bool IsActive { get; set; } = true;
 
     public User? User { get; set; }
     public Category? Category { get; set; }

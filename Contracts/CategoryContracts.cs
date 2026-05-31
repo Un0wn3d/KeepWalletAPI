@@ -38,7 +38,8 @@ public record UpdateUserCategoryPreferencesRequest(
 public record UserCategoryPreferenceUpdate(
     int CategoryId,
     string? IconKey = null,
-    string? Color = null
+    string? Color = null,
+    bool? IsActive = null
 );
 
 public record MergeCategoryRequest(

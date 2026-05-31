@@ -73,8 +73,12 @@ INSERT INTO categories (name, type) VALUES
     ('Інші витрати',          'expense');
 
 CREATE TABLE user_category_preferences (
-    user_id UUID PRIMARY KEY REFERENCES users(id),
-    category_id INT REFERENCES categories(id)
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category_id INT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    icon_key VARCHAR(50),
+    color VARCHAR(10),
+    is_active BOOLEAN DEFAULT TRUE,
+    PRIMARY KEY (user_id, category_id)
 );
 
 CREATE TABLE budgets (

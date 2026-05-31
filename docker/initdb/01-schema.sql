@@ -67,6 +67,9 @@ INSERT INTO categories (name, type, icon_key) VALUES
 CREATE TABLE user_category_preferences (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    icon_key VARCHAR(50),
+    color VARCHAR(10),
+    is_active BOOLEAN DEFAULT TRUE,
     PRIMARY KEY (user_id, category_id)
 );
 CREATE INDEX idx_user_category_preferences_user_id ON user_category_preferences(user_id);
