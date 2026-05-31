@@ -2,8 +2,8 @@ namespace KeepWalletAPI.Models;
 
 public enum UserRole
 {
-    Admin,
-    User
+    User,
+    Admin
 }
 
 public class User

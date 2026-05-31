@@ -6,7 +6,6 @@ public record CreateTransactionRequest(
     Guid AccountId,
     Guid? GroupId,
     int CategoryId,
-    int? SavingId,
     int? RecurringPaymentId,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
     [StringLength(500)] string? Description,
@@ -17,7 +16,6 @@ public record UpdateTransactionRequest(
     Guid AccountId,
     Guid? GroupId,
     int CategoryId,
-    int? SavingId,
     int? RecurringPaymentId,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
     [StringLength(500)] string? Description,
@@ -31,7 +29,6 @@ public record TransactionResponse(
     string? GroupName,
     string? SharedBy,
     int CategoryId,
-    int? SavingId,
     int? RecurringPaymentId,
     decimal Amount,
     string? Description,
@@ -44,7 +41,7 @@ public record CreatePlannedTransactionRequest(
     [Required, StringLength(200)] string Name,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
     [StringLength(500)] string? Description,
-    DateTimeOffset NextDueDate,
+    DateOnly NextDueDate,
     TimeSpan RepeatInterval
 );
 
@@ -58,8 +55,6 @@ public record PlannedTransactionResponse(
     string? Description,
     DateTimeOffset TransactionDate,
     TimeSpan RepeatInterval,
-    DateTimeOffset NextDueDate,
+    DateOnly NextDueDate,
     bool IsActive
 );
-
-public record ConfirmPlannedTransactionRequest(Guid AccountId);

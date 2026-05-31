@@ -6,7 +6,7 @@ namespace KeepWalletAPI.Security;
 
 public sealed class RefreshTokenService(IConfiguration configuration)
 {
-    public (string RawToken, RefreshToken StoredToken) CreateToken(Guid userId, Guid jwtId, string? createdByIp)
+    public (string RawToken, RefreshToken StoredToken) CreateToken(Guid userId, string? createdByIp)
     {
         var rawToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));
         var now = DateTimeOffset.UtcNow;
@@ -17,11 +17,9 @@ public sealed class RefreshTokenService(IConfiguration configuration)
             Id = Guid.NewGuid(),
             UserId = userId,
             TokenHash = Hash(rawToken),
-            JwtId = jwtId,
             ExpiresAt = now.AddDays(expiresDays),
             CreatedByIp = createdByIp,
-            CreatedAt = now,
-            UpdatedAt = now
+            CreatedAt = now
         };
 
         return (rawToken, storedToken);
@@ -35,5 +33,5 @@ public sealed class RefreshTokenService(IConfiguration configuration)
     }
 
     public bool IsActive(RefreshToken token, DateTimeOffset nowUtc) =>
-        token.RevokedAt is null && token.ExpiresAt > nowUtc;
+        token.ExpiresAt > nowUtc;
 }

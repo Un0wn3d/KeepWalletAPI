@@ -5,8 +5,6 @@ public record AuditLogResponse(
     Guid? UserId,
     string? Username,
     string Action,
-    string? EntityType,
     string? Details,
-    string? Device,
     DateTimeOffset CreatedAt
 );

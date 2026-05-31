@@ -1,4 +1,4 @@
-﻿-- 1. КОРИСТУВАЧІ ТА РОЛІ
+-- 1. КОРИСТУВАЧІ ТА РОЛІ
 CREATE TYPE user_role AS ENUM ('admin', 'user');
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- для gen_random_uuid()
 
@@ -18,7 +18,6 @@ CREATE TYPE user_group_role AS ENUM ('owner', 'member', 'viewer');
 CREATE TABLE groups (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     icon_key      VARCHAR(50),
-    color         VARCHAR(10),
     name          VARCHAR(100) NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -32,12 +31,17 @@ CREATE TABLE group_members (
 );
 CREATE INDEX idx_group_members_user_id ON group_members(user_id);
 
+-- Migration for databases created before group memberships supported multiple users.
+ALTER TABLE group_members DROP CONSTRAINT IF EXISTS group_members_pkey;
+ALTER TABLE group_members ADD PRIMARY KEY (group_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
+
 -- 3. РАХУНКИ КОРИСТУВАЧА АБО ГРУПИ
 CREATE TABLE accounts (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id     UUID  REFERENCES groups(id) ON DELETE SET NULL,
-    name         VARCHAR(100) NOT NULL, -- e.g. 'Main', 'Cash', 'Mono Card'
+    name         VARCHAR(100) NOT NULL, -- 'Основний', 'Готівка', 'Карта Mono'
     currency     VARCHAR(3) NOT NULL DEFAULT 'UAH', -- ISO 4217
     balance      NUMERIC(15,2) DEFAULT 0.00,
     is_default   BOOLEAN DEFAULT FALSE,
@@ -49,53 +53,80 @@ CREATE INDEX idx_accounts_user_id ON accounts(user_id);
 CREATE TYPE category_type AS ENUM ('income', 'expense');
 CREATE TABLE categories (
     id          SERIAL PRIMARY KEY,
+    icon_key    VARCHAR(50),
     name        VARCHAR(100) NOT NULL,
     type        category_type NOT NULL
 );
 
+-- Системні категорії (загальні для всіх)
+INSERT INTO categories (name, type) VALUES
+    ('Їжа',                   'expense'),
+    ('Транспорт',             'expense'),
+    ('Комунальні послуги',    'expense'),
+    ('Розваги',               'expense'),
+    ('Здоровя',               'expense'),
+    ('Одяг',                  'expense'),
+    ('Освіта',                'expense'),
+    ('Зарплата',              'income'),
+    ('Фріланс',               'income'),
+    ('Інші доходи',           'income'),
+    ('Інші витрати',          'expense');
+
 CREATE TABLE user_category_preferences (
-    user_id UUID REFERENCES users(id),
-    category_id INT REFERENCES categories(id),
-    icon_key    VARCHAR(50),
-    color       VARCHAR(10)
+    user_id UUID PRIMARY KEY REFERENCES users(id),
+    category_id INT REFERENCES categories(id)
 );
 
 CREATE TABLE budgets (
     id            SERIAL PRIMARY KEY,
-    account_id    UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id      UUID REFERENCES groups(id) ON DELETE SET NULL,
     category_id   INT NOT NULL REFERENCES categories(id),
-    amount        NUMERIC(15,2) CHECK (amount >= 0)
+    amount        NUMERIC(15,2) CHECK (amount >= 0),
+    budget_period INTERVAL, -- '1 month'
+    start_date    DATE NOT NULL DEFAULT CURRENT_DATE,
+    is_active     BOOLEAN DEFAULT TRUE
 );
-CREATE INDEX idx_budgets_user_id     ON budgets(account_id);
+CREATE INDEX idx_budgets_user_id     ON budgets(user_id);
 
 -- 5. ТРАНЗАКЦІЇ ТА РЕГУЛЯРНІ / ЗАПЛАНОВАНІ ПЛАТЕЖІ
 CREATE TABLE recurring_payments (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(200) NOT NULL,
     repeat_interval INTERVAL NOT NULL,
-    next_due_date   TIMESTAMPTZ NOT NULL,
+    next_due_date   DATE NOT NULL,
     is_active       BOOLEAN DEFAULT TRUE
 );
 
--- 6. СКАРБНИЧКИ, СПИСОК БАЖАНОГО
+CREATE TABLE transactions (
+    id               SERIAL PRIMARY KEY,
+    account_id       UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    group_id         UUID REFERENCES groups(id) ON DELETE SET NULL,
+    category_id      INT NOT NULL REFERENCES categories(id),
+    recurring_payments_id INT REFERENCES recurring_payments(id) ON DELETE SET NULL,
+    amount           NUMERIC(15,2) CHECK (amount > 0),
+    description      VARCHAR(500),
+    transaction_date TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_transactions_account_date ON transactions(account_id, transaction_date DESC);
+CREATE INDEX idx_transactions_account_type ON transactions(account_id, category_id);
+
+-- 6. СКАРБНИЧКИ, ВІДСОТКИ, СПИСОК БАЖАНОГО
 CREATE TABLE savings (
     id             SERIAL PRIMARY KEY,
     user_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id       UUID REFERENCES groups(id) ON DELETE SET NULL,
     name           VARCHAR(200) NOT NULL,
-    currency       VARCHAR(3) NOT NULL DEFAULT 'UAH', -- ISO 4217
-    icon_key       VARCHAR(50),
-    color          VARCHAR(10),
     target_amount  NUMERIC(15,2) CHECK (target_amount > 0),
     current_amount NUMERIC(15,2) DEFAULT 0.00 CHECK (current_amount >= 0),
     deadline       DATE,
-    is_completed   BOOLEAN DEFAULT FALSE
+    is_completed   BOOLEAN DEFAULT FALSE,
+    created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_savings_user_id ON savings(user_id);
 CREATE INDEX idx_savings_user_completed ON savings(user_id, is_completed);
 
-    CREATE TABLE wish_list (
+CREATE TABLE wish_list (
     id             SERIAL PRIMARY KEY,
     saving_id      INT NOT NULL REFERENCES savings(id) ON DELETE CASCADE,
     name           VARCHAR(255) NOT NULL,
@@ -105,21 +136,31 @@ CREATE INDEX idx_savings_user_completed ON savings(user_id, is_completed);
 );
 CREATE INDEX idx_wish_list_savings ON wish_list(saving_id);
 
-CREATE TABLE transactions (
-    id               SERIAL PRIMARY KEY,
-    account_id       UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    group_id         UUID REFERENCES groups(id) ON DELETE SET NULL,
-    category_id      INT NOT NULL REFERENCES categories(id),
-    saving_id        INT REFERENCES savings(id) ON DELETE SET NULL,
-    recurring_payments_id INT REFERENCES recurring_payments(id) ON DELETE SET NULL,
-    amount           NUMERIC(15,2) CHECK (amount >= 0),
-    name             VARCHAR(500),
-    transaction_date TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- 7. ЛОГУВАННЯ ДІЙ КОРИСТУВАЧА (AUDIT TRAIL)
+CREATE TABLE logs (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+    action      VARCHAR(100) NOT NULL,   -- 'LOGIN', 'CREATE_TRANSACTION', 'DELETE_SAVING', ...
+    entity_type VARCHAR(100),            -- 'transaction', 'saving', 'piggy_bank', ...
+    details     JSONB,                    -- JSON-рядок із деталями дії
+    device      VARCHAR(45),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX idx_transactions_account_date ON transactions(account_id, transaction_date DESC);
-CREATE INDEX idx_transactions_account_type ON transactions(account_id, category_id);
-CREATE INDEX idx_transactions_saving_id ON transactions(saving_id);
+CREATE INDEX idx_logs_user_id    ON logs(user_id);
+CREATE INDEX idx_logs_created_at ON logs(created_at);
+CREATE INDEX idx_logs_action     ON logs(action);
 
+-- 8. AUTH / DEVICE SESSIONS
+CREATE TABLE refresh_tokens (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash           VARCHAR(128) NOT NULL UNIQUE,
+    expires_at           TIMESTAMPTZ NOT NULL,
+    created_by_ip        VARCHAR(64) NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
 
 -- -- Поточний баланс рахунку (зручний для читання)
 -- CREATE VIEW v_account_balances AS
@@ -282,133 +323,3 @@ WHERE t.recurring_payments_id IS NULL
   AND t.transaction_date < (CURRENT_DATE + INTERVAL '1 day')
 GROUP BY a.user_id, c.id, c.type
 ORDER BY a.user_id, transactions_count DESC, total_amount DESC;
-
--- ============================================================
--- LOGS / AUDIT
--- ============================================================
-CREATE TABLE logs (
-    id          BIGSERIAL PRIMARY KEY,
-    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
-    action      VARCHAR(100) NOT NULL,
-    details     JSONB,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_logs_user_id    ON logs(user_id);
-CREATE INDEX idx_logs_created_at ON logs(created_at);
-CREATE INDEX idx_logs_action     ON logs(action);
-CREATE INDEX idx_logs_details_gin ON logs USING GIN(details);
-
-CREATE OR REPLACE FUNCTION fn_log_changes()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_user_id UUID;
-BEGIN
-    BEGIN
-        v_user_id := current_setting('app.current_user_id')::UUID;
-    EXCEPTION WHEN OTHERS THEN
-        v_user_id := NULL;
-    END;
-
-    IF TG_OP = 'INSERT' THEN
-        INSERT INTO logs (user_id, action, details)
-        VALUES (
-            v_user_id,
-            'CREATE_' || UPPER(TG_TABLE_NAME),
-            jsonb_build_object('new_data', to_jsonb(NEW))
-        );
-        RETURN NEW;
-    ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO logs (user_id, action, details)
-        VALUES (
-            v_user_id,
-            'UPDATE_' || UPPER(TG_TABLE_NAME),
-            jsonb_build_object('old_data', to_jsonb(OLD), 'new_data', to_jsonb(NEW))
-        );
-        RETURN NEW;
-    ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO logs (user_id, action, details)
-        VALUES (
-            v_user_id,
-            'DELETE_' || UPPER(TG_TABLE_NAME),
-            jsonb_build_object('deleted_data', to_jsonb(OLD))
-        );
-        RETURN OLD;
-    END IF;
-
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_users_logs ON users;
-CREATE TRIGGER trg_users_logs
-    AFTER INSERT OR UPDATE OR DELETE ON users
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_groups_logs ON groups;
-CREATE TRIGGER trg_groups_logs
-    AFTER INSERT OR UPDATE OR DELETE ON groups
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_group_members_logs ON group_members;
-CREATE TRIGGER trg_group_members_logs
-    AFTER INSERT OR UPDATE OR DELETE ON group_members
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_accounts_logs ON accounts;
-CREATE TRIGGER trg_accounts_logs
-    AFTER INSERT OR UPDATE OR DELETE ON accounts
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_categories_logs ON categories;
-CREATE TRIGGER trg_categories_logs
-    AFTER INSERT OR UPDATE OR DELETE ON categories
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_user_category_preferences_logs ON user_category_preferences;
-CREATE TRIGGER trg_user_category_preferences_logs
-    AFTER INSERT OR UPDATE OR DELETE ON user_category_preferences
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_budgets_logs ON budgets;
-CREATE TRIGGER trg_budgets_logs
-    AFTER INSERT OR UPDATE OR DELETE ON budgets
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_recurring_payments_logs ON recurring_payments;
-CREATE TRIGGER trg_recurring_payments_logs
-    AFTER INSERT OR UPDATE OR DELETE ON recurring_payments
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_transactions_logs ON transactions;
-CREATE TRIGGER trg_transactions_logs
-    AFTER INSERT OR UPDATE OR DELETE ON transactions
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_savings_logs ON savings;
-CREATE TRIGGER trg_savings_logs
-    AFTER INSERT OR UPDATE OR DELETE ON savings
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
-DROP TRIGGER IF EXISTS trg_wish_list_logs ON wish_list;
-CREATE TRIGGER trg_wish_list_logs
-    AFTER INSERT OR UPDATE OR DELETE ON wish_list
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();
-
--- ============================================================
--- AUTH / DEVICE SESSIONS
--- ============================================================
-CREATE TABLE refresh_tokens (
-    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash           VARCHAR(128) NOT NULL UNIQUE,
-    expires_at           TIMESTAMPTZ NOT NULL,
-    created_by_ip        VARCHAR(64),
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens(user_id);
-CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
-
-DROP TRIGGER IF EXISTS trg_refresh_tokens_logs ON refresh_tokens;
-CREATE TRIGGER trg_refresh_tokens_logs
-    AFTER INSERT OR UPDATE OR DELETE ON refresh_tokens
-    FOR EACH ROW EXECUTE FUNCTION fn_log_changes();

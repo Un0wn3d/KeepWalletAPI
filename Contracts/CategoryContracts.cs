@@ -5,7 +5,7 @@ public record CategoryResponse(
     string Name,
     string Type,
     string IconKey,
-    string? Color
+    string? Color = null
 );
 
 public record CreateCategoryRequest(
@@ -31,7 +31,14 @@ public record UserCategoryPreferenceResponse(
 );
 
 public record UpdateUserCategoryPreferencesRequest(
-    IReadOnlyList<int> SelectedCategoryIds
+    IReadOnlyList<int> SelectedCategoryIds,
+    IReadOnlyList<UserCategoryPreferenceUpdate>? Preferences = null
+);
+
+public record UserCategoryPreferenceUpdate(
+    int CategoryId,
+    string? IconKey = null,
+    string? Color = null
 );
 
 public record MergeCategoryRequest(

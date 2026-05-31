@@ -9,8 +9,6 @@ public class BankAccount
     public string Currency { get; set; } = "UAH";
     public decimal Balance { get; set; }
     public bool IsDefault { get; set; }
-    public DateTimeOffset CreatedAt { get; set; }
-    public DateTimeOffset UpdatedAt { get; set; }
 
     public User? User { get; set; }
     public Group? Group { get; set; }

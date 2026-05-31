@@ -14,5 +14,4 @@ public class Transaction
 
     public BankAccount? Account { get; set; }
     public Group? Group { get; set; }
-    public Saving? Saving { get; set; }
 }

@@ -25,7 +25,5 @@ public record BankAccountResponse(
     string Name,
     string Currency,
     decimal Balance,
-    bool IsDefault,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt
+    bool IsDefault
 );

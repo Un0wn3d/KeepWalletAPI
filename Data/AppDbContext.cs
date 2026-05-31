@@ -57,14 +57,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasDefaultValueSql("gen_random_uuid()");
             entity.Property(x => x.UserId).HasColumnName("user_id");
             entity.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(128).IsRequired();
-            entity.Property(x => x.JwtId).HasColumnName("jwt_id");
             entity.Property(x => x.ExpiresAt).HasColumnName("expires_at");
-            entity.Property(x => x.RevokedAt).HasColumnName("revoked_at");
-            entity.Property(x => x.ReplacedByTokenId).HasColumnName("replaced_by_token_id");
             entity.Property(x => x.CreatedByIp).HasColumnName("created_by_ip").HasMaxLength(64);
-            entity.Property(x => x.RevokedByIp).HasColumnName("revoked_by_ip").HasMaxLength(64);
             entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
-            entity.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("NOW()");
 
             entity.HasOne(x => x.User)
                 .WithMany(x => x.RefreshTokens)
@@ -74,7 +69,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasIndex(x => x.UserId).HasDatabaseName("idx_refresh_tokens_user_id");
             entity.HasIndex(x => x.TokenHash).HasDatabaseName("ux_refresh_tokens_token_hash").IsUnique();
             entity.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_refresh_tokens_expires_at");
-            entity.HasIndex(x => x.JwtId).HasDatabaseName("idx_refresh_tokens_jwt_id");
         });
 
         modelBuilder.Entity<Transaction>(entity =>
@@ -89,7 +83,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.SavingId).HasColumnName("saving_id");
             entity.Property(x => x.RecurringPaymentId).HasColumnName("recurring_payments_id");
             entity.Property(x => x.Amount).HasColumnName("amount").HasColumnType("numeric(15,2)");
-            entity.Property(x => x.Description).HasColumnName("description").HasMaxLength(500);
+            entity.Property(x => x.Description).HasColumnName("name").HasMaxLength(500);
             entity.Property(x => x.TransactionDate).HasColumnName("transaction_date");
 
             entity.HasOne(x => x.Account)
@@ -102,14 +96,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasForeignKey(x => x.GroupId)
                 .OnDelete(DeleteBehavior.SetNull);
 
-            entity.HasOne(x => x.Saving)
-                .WithMany()
-                .HasForeignKey(x => x.SavingId)
-                .OnDelete(DeleteBehavior.SetNull);
-
             entity.HasIndex(x => new { x.AccountId, x.TransactionDate }).HasDatabaseName("idx_transactions_account_date");
             entity.HasIndex(x => new { x.AccountId, x.CategoryId }).HasDatabaseName("idx_transactions_account_type");
-            entity.HasIndex(x => x.SavingId).HasDatabaseName("idx_transactions_saving_id");
         });
 
         modelBuilder.Entity<BankAccount>(entity =>
@@ -126,8 +114,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).IsRequired();
             entity.Property(x => x.Balance).HasColumnName("balance").HasColumnType("numeric(15,2)");
             entity.Property(x => x.IsDefault).HasColumnName("is_default").HasDefaultValue(false);
-            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
-            entity.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("NOW()");
 
             entity.HasOne(x => x.User)
                 .WithMany()
@@ -153,12 +139,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
             entity.Property(x => x.TargetAmount).HasColumnName("target_amount").HasColumnType("numeric(15,2)");
             entity.Property(x => x.CurrentAmount).HasColumnName("current_amount").HasColumnType("numeric(15,2)");
-            entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).HasDefaultValue("UAH").IsRequired();
-            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
-            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
             entity.Property(x => x.Deadline).HasColumnName("deadline");
             entity.Property(x => x.IsCompleted).HasColumnName("is_completed").HasDefaultValue(false);
-            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
 
             entity.HasOne(x => x.User)
                 .WithMany()
@@ -197,7 +179,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
             entity.Property(x => x.RepeatInterval).HasColumnName("repeat_interval");
-            entity.Property(x => x.NextDueDate).HasColumnName("next_due_date").HasColumnType("timestamp with time zone");
+            entity.Property(x => x.NextDueDate).HasColumnName("next_due_date");
             entity.Property(x => x.IsActive).HasColumnName("is_active").HasDefaultValue(true);
         });
 
@@ -209,8 +191,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
             entity.Property(x => x.Type).HasColumnName("type").HasColumnType("category_type");
-            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50).HasDefaultValue("other");
-            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
         });
 
         modelBuilder.Entity<PopularCategoryLast30Days>(entity =>
@@ -233,6 +213,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
             entity.Property(x => x.UserId).HasColumnName("user_id");
             entity.Property(x => x.CategoryId).HasColumnName("category_id");
+            entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
+            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
 
             entity.HasOne(x => x.User)
                 .WithMany()
@@ -253,17 +235,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasKey(x => x.Id);
 
             entity.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
-            entity.Property(x => x.UserId).HasColumnName("user_id");
+            entity.Property(x => x.AccountId).HasColumnName("account_id");
             entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.CategoryId).HasColumnName("category_id");
             entity.Property(x => x.Amount).HasColumnName("amount").HasColumnType("numeric(15,2)");
-            entity.Property(x => x.BudgetPeriod).HasColumnName("budget_period");
-            entity.Property(x => x.StartDate).HasColumnName("start_date").HasDefaultValueSql("CURRENT_DATE");
-            entity.Property(x => x.IsActive).HasColumnName("is_active").HasDefaultValue(true);
 
-            entity.HasOne(x => x.User)
+            entity.HasOne(x => x.Account)
                 .WithMany()
-                .HasForeignKey(x => x.UserId)
+                .HasForeignKey(x => x.AccountId)
                 .OnDelete(DeleteBehavior.Cascade);
 
             entity.HasOne(x => x.Group)
@@ -276,8 +255,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasForeignKey(x => x.CategoryId)
                 .OnDelete(DeleteBehavior.Restrict);
 
-            entity.HasIndex(x => x.UserId).HasDatabaseName("idx_budgets_user_id");
-            entity.HasIndex(x => new { x.UserId, x.CategoryId, x.IsActive }).HasDatabaseName("idx_budgets_user_category_active");
+            entity.HasIndex(x => x.AccountId).HasDatabaseName("idx_budgets_user_id");
         });
 
         modelBuilder.Entity<Group>(entity =>
@@ -322,9 +300,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.UserId).HasColumnName("user_id");
             entity.Property(x => x.Action).HasColumnName("action").HasMaxLength(100).IsRequired();
-            entity.Property(x => x.EntityType).HasColumnName("entity_type").HasMaxLength(100);
             entity.Property(x => x.Details).HasColumnName("details").HasColumnType("jsonb");
-            entity.Property(x => x.Device).HasColumnName("device").HasMaxLength(45);
             entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
 
             entity.HasOne(x => x.User)
