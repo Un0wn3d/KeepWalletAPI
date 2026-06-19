@@ -30,8 +30,7 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - keepwallet_postgres_data:/var/lib/postgresql/data
-      - ../KeepWalletDB/Postgre.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
-      - ../KeepWalletDB/Triggers.sql:/docker-entrypoint-initdb.d/02-triggers.sql:ro
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-KeepWallet} -d ${POSTGRES_DB:-KeepWallet}"]
       interval: 5s
