@@ -25,5 +25,8 @@ public record BankAccountResponse(
     string Name,
     string Currency,
     decimal Balance,
-    bool IsDefault
+    bool IsDefault,
+    string? GroupName = null,
+    string? GroupColor = null,
+    string? GroupOwnerDisplay = null
 );

@@ -4,7 +4,6 @@ public class Saving
 {
     public int Id { get; set; }
     public Guid UserId { get; set; }
-    public Guid? GroupId { get; set; }
     public string Name { get; set; } = string.Empty;
     public string Currency { get; set; } = "UAH";
     public string? IconKey { get; set; }

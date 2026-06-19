@@ -4,12 +4,14 @@ namespace KeepWalletAPI.Contracts;
 
 public record CreateGroupRequest(
     [Required, StringLength(100)] string Name,
-    [StringLength(50)] string? IconKey = null
+    [StringLength(50)] string? IconKey = null,
+    [StringLength(10)] string? Color = null
 );
 
 public record UpdateGroupRequest(
     [Required, StringLength(100)] string Name,
-    [StringLength(50)] string? IconKey = null
+    [StringLength(50)] string? IconKey = null,
+    [StringLength(10)] string? Color = null
 );
 
 public record AddGroupMemberRequest(
@@ -29,13 +31,19 @@ public record ShareResourceWithGroupRequest(
     Guid? GroupId
 );
 
+public record ReplaceResourceGroupsRequest(
+    IReadOnlyList<Guid> GroupIds
+);
+
 public record GroupResponse(
     Guid Id,
     string Name,
     string IconKey,
+    string? Color,
     string RoleName,
     DateTimeOffset CreatedAt,
-    int MemberCount
+    int MemberCount,
+    string? OwnerDisplay = null
 );
 
 public record GroupMemberResponse(

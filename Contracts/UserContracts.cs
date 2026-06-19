@@ -16,7 +16,8 @@ public record UpdateUserRequest(
     [EmailAddress, StringLength(255)] string? Email = null,
     [StringLength(255)] string? Password = null,
     [StringLength(255)] string? FullName = null,
-    bool? IsActive = null
+    bool? IsActive = null,
+    DateTimeOffset? CreatedAt = null
 );
 
 public record UserResponse(

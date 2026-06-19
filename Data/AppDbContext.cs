@@ -18,7 +18,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<Budget> Budgets => Set<Budget>();
     public DbSet<Group> Groups => Set<Group>();
     public DbSet<GroupMember> GroupMembers => Set<GroupMember>();
+    public DbSet<GroupResourceAccess> GroupResourceAccess => Set<GroupResourceAccess>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<AppSetting> AppSettings => Set<AppSetting>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -78,7 +80,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.AccountId).HasColumnName("account_id");
-            entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.CategoryId).HasColumnName("category_id");
             entity.Property(x => x.SavingId).HasColumnName("saving_id");
             entity.Property(x => x.RecurringPaymentId).HasColumnName("recurring_payments_id");
@@ -90,11 +91,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .WithMany()
                 .HasForeignKey(x => x.AccountId)
                 .OnDelete(DeleteBehavior.Cascade);
-
-            entity.HasOne(x => x.Group)
-                .WithMany()
-                .HasForeignKey(x => x.GroupId)
-                .OnDelete(DeleteBehavior.SetNull);
 
             entity.HasIndex(x => new { x.AccountId, x.TransactionDate }).HasDatabaseName("idx_transactions_account_date");
             entity.HasIndex(x => new { x.AccountId, x.CategoryId }).HasDatabaseName("idx_transactions_account_type");
@@ -109,7 +105,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .HasColumnName("id")
                 .HasDefaultValueSql("gen_random_uuid()");
             entity.Property(x => x.UserId).HasColumnName("user_id");
-            entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
             entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).IsRequired();
             entity.Property(x => x.Balance).HasColumnName("balance").HasColumnType("numeric(15,2)");
@@ -119,11 +114,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .WithMany()
                 .HasForeignKey(x => x.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
-
-            entity.HasOne(x => x.Group)
-                .WithMany()
-                .HasForeignKey(x => x.GroupId)
-                .OnDelete(DeleteBehavior.SetNull);
 
             entity.HasIndex(x => x.UserId).HasDatabaseName("idx_accounts_user_id");
         });
@@ -135,7 +125,6 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.UserId).HasColumnName("user_id");
-            entity.Property(x => x.GroupId).HasColumnName("group_id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
             entity.Property(x => x.Currency).HasColumnName("currency").HasMaxLength(3).HasDefaultValue("UAH");
             entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50);
@@ -181,7 +170,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
             entity.Property(x => x.Id).HasColumnName("id");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(200).IsRequired();
-            entity.Property(x => x.RepeatInterval).HasColumnName("repeat_interval");
+            entity.Ignore(x => x.RepeatInterval);
             entity.Property(x => x.NextDueDate).HasColumnName("next_due_date");
             entity.Property(x => x.IsActive).HasColumnName("is_active").HasDefaultValue(true);
         });
@@ -270,6 +259,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
             entity.Property(x => x.Name).HasColumnName("name").HasMaxLength(100).IsRequired();
             entity.Property(x => x.IconKey).HasColumnName("icon_key").HasMaxLength(50).HasDefaultValue("other");
+            entity.Property(x => x.Color).HasColumnName("color").HasMaxLength(10);
             entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
         });
 
@@ -296,6 +286,55 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasIndex(x => x.UserId).HasDatabaseName("idx_group_members_user_id");
         });
 
+        modelBuilder.Entity<GroupResourceAccess>(entity =>
+        {
+            entity.ToTable("group_resource_access");
+            entity.HasNoKey();
+
+            entity.Property(x => x.GroupId).HasColumnName("group_id");
+            entity.Property(x => x.AccountId).HasColumnName("account_id");
+            entity.Property(x => x.SavingId).HasColumnName("saving_id");
+            entity.Property(x => x.TransactionId).HasColumnName("transaction_id");
+            entity.Property(x => x.SharedBy).HasColumnName("shared_by");
+
+            entity.ToTable(t => t.HasCheckConstraint(
+                "ck_group_resource_access_single_resource",
+                "((account_id IS NOT NULL)::int + (saving_id IS NOT NULL)::int + (transaction_id IS NOT NULL)::int = 1)"));
+
+            entity.HasOne(x => x.Group)
+                .WithMany()
+                .HasForeignKey(x => x.GroupId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.Account)
+                .WithMany()
+                .HasForeignKey(x => x.AccountId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.Saving)
+                .WithMany()
+                .HasForeignKey(x => x.SavingId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.Transaction)
+                .WithMany()
+                .HasForeignKey(x => x.TransactionId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(x => x.SharedByUser)
+                .WithMany()
+                .HasForeignKey(x => x.SharedBy)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasIndex(x => x.GroupId).HasDatabaseName("idx_group_resource_access_group_id");
+            entity.HasIndex(x => x.AccountId).HasDatabaseName("idx_group_resource_access_account_id");
+            entity.HasIndex(x => x.SavingId).HasDatabaseName("idx_group_resource_access_saving_id");
+            entity.HasIndex(x => x.TransactionId).HasDatabaseName("idx_group_resource_access_transaction_id");
+            entity.HasIndex(x => new { x.GroupId, x.AccountId }).IsUnique();
+            entity.HasIndex(x => new { x.GroupId, x.SavingId }).IsUnique();
+            entity.HasIndex(x => new { x.GroupId, x.TransactionId }).IsUnique();
+        });
+
         modelBuilder.Entity<AuditLog>(entity =>
         {
             entity.ToTable("logs");
@@ -315,6 +354,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasIndex(x => x.UserId).HasDatabaseName("idx_logs_user_id");
             entity.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_logs_created_at");
             entity.HasIndex(x => x.Action).HasDatabaseName("idx_logs_action");
+        });
+
+        modelBuilder.Entity<AppSetting>(entity =>
+        {
+            entity.ToTable("app_settings");
+            entity.HasKey(x => x.Key);
+
+            entity.Property(x => x.Key).HasColumnName("key").HasMaxLength(100).IsRequired();
+            entity.Property(x => x.Value).HasColumnName("value").HasMaxLength(500).IsRequired();
         });
     }
 }

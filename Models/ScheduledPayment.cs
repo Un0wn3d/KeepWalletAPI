@@ -1,10 +1,15 @@
 namespace KeepWalletAPI.Models;
 
+using System.ComponentModel.DataAnnotations.Schema;
+
 public class ScheduledPayment
 {
     public int Id { get; set; }
     public string Name { get; set; } = string.Empty;
+
+    [NotMapped]
     public TimeSpan RepeatInterval { get; set; }
+
     public DateTimeOffset NextDueDate { get; set; }
     public bool IsActive { get; set; } = true;
 }

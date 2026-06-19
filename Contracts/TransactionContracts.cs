@@ -40,6 +40,7 @@ public record TransactionResponse(
 
 public record CreatePlannedTransactionRequest(
     Guid AccountId,
+    Guid? GroupId,
     int CategoryId,
     [Required, StringLength(200)] string Name,
     [Range(typeof(decimal), "0.01", "999999999")] decimal Amount,
@@ -51,6 +52,8 @@ public record CreatePlannedTransactionRequest(
 public record PlannedTransactionResponse(
     int Id,
     Guid AccountId,
+    Guid? GroupId,
+    string? GroupName,
     int CategoryId,
     int RecurringPaymentId,
     string Name,
@@ -59,5 +62,9 @@ public record PlannedTransactionResponse(
     DateTimeOffset TransactionDate,
     TimeSpan RepeatInterval,
     DateOnly NextDueDate,
-    bool IsActive
+    bool IsActive,
+    string? OwnerDisplay = null,
+    string? Currency = null
 );
+
+public record ConfirmPlannedTransactionRequest(Guid AccountId);

@@ -10,6 +10,7 @@ using Microsoft.IdentityModel.Tokens;
 using Npgsql;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -38,6 +39,7 @@ var cookieSameSiteMode = ParseSameSiteMode(builder.Configuration["Auth:CookieSam
 var useSecureCookies = bool.TryParse(builder.Configuration["Auth:UseSecureCookies"], out var secureCookiesParsed)
     ? secureCookiesParsed
     : !builder.Environment.IsDevelopment();
+const string AppSettingsFileName = "app-settings.json";
 
 if (cookieSameSiteMode == SameSiteMode.None && !useSecureCookies)
 {
@@ -161,6 +163,20 @@ app.MapGet("/api/roles", () => Results.Ok(new[]
     new { Name = "admin", Description = "Administrator" },
     new { Name = "user", Description = "Regular user" }
 }));
+
+app.MapGet("/api/app-settings", async (IWebHostEnvironment env, CancellationToken ct) =>
+{
+    return Results.Ok(new AppSettingsResponse(await IsRegistrationEnabledAsync(env.ContentRootPath, ct)));
+});
+
+app.MapPatch("/api/app-settings", async (
+    UpdateAppSettingsRequest request,
+    IWebHostEnvironment env,
+    CancellationToken ct) =>
+{
+    await SetRegistrationEnabledAsync(env.ContentRootPath, request.RegistrationEnabled, ct);
+    return Results.Ok(new AppSettingsResponse(request.RegistrationEnabled));
+}).RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/categories", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
@@ -566,8 +582,8 @@ app.MapPut("/api/budgets/category/{categoryId:int}", async (
 
     var account = await db.BankAccounts
         .Where(a => request.GroupId.HasValue
-            ? a.GroupId == request.GroupId.Value
-            : a.UserId == userId.Value && a.GroupId == null)
+            ? db.GroupResourceAccess.Any(access => access.AccountId == a.Id && access.GroupId == request.GroupId.Value)
+            : a.UserId == userId.Value)
         .OrderByDescending(a => a.IsDefault)
         .ThenBy(a => a.Name)
         .FirstOrDefaultAsync(ct);
@@ -694,6 +710,7 @@ app.MapPatch("/api/users/{id:guid}", async (Guid id, UpdateUserRequest request, 
     if (request.Password is not null) user.PasswordHash = hasher.Hash(request.Password);
     if (request.FullName is not null) user.FullName = request.FullName.Trim();
     if (request.IsActive.HasValue) user.IsActive = request.IsActive.Value;
+    if (request.CreatedAt.HasValue) user.CreatedAt = request.CreatedAt.Value;
     await db.SaveChangesAsync(ct);
     return Results.NoContent();
 }).RequireAuthorization("AdminOnly");
@@ -730,6 +747,7 @@ app.MapPut("/api/users/{id:guid}", async (Guid id, UpdateUserRequest request, Cl
     user.PasswordHash = hasher.Hash(request.Password);
     user.FullName = request.FullName?.Trim();
     user.IsActive = request.IsActive.Value;
+    if (request.CreatedAt.HasValue) user.CreatedAt = request.CreatedAt.Value;
     await db.SaveChangesAsync(ct);
     return Results.NoContent();
 }).RequireAuthorization("AdminOnly");
@@ -745,7 +763,37 @@ app.MapDelete("/api/users/{id:guid}", async (Guid id, ClaimsPrincipal principal,
         return Results.NotFound();
     }
 
-    db.Users.Remove(user);
+    var plannedTransactions = await db.Transactions
+        .Include(t => t.Account)
+        .Where(t => t.RecurringPaymentId != null && t.Account != null && t.Account.UserId == id)
+        .ToListAsync(ct);
+    var plannedPaymentIds = plannedTransactions
+        .Select(t => t.RecurringPaymentId)
+        .Where(paymentId => paymentId.HasValue)
+        .Select(paymentId => paymentId!.Value)
+        .Distinct()
+        .ToArray();
+    db.Transactions.RemoveRange(plannedTransactions);
+
+    if (plannedPaymentIds.Length > 0)
+    {
+        var plannedPayments = await db.ScheduledPayments
+            .Where(payment => plannedPaymentIds.Contains(payment.Id))
+            .ToListAsync(ct);
+        db.ScheduledPayments.RemoveRange(plannedPayments);
+    }
+
+    var groupMemberships = await db.GroupMembers
+        .Where(member => member.UserId == id)
+        .ToListAsync(ct);
+    db.GroupMembers.RemoveRange(groupMemberships);
+
+    user.IsActive = false;
+    user.Username = $"deleted-{id:N}";
+    user.Email = $"deleted-{id:N}@deleted.local";
+    user.FullName = null;
+    user.PasswordHash = string.Empty;
+
     await db.SaveChangesAsync(ct);
     return Results.NoContent();
 }).RequireAuthorization("AdminOnly");
@@ -770,22 +818,32 @@ app.MapGet("/api/groups", async (ClaimsPrincipal principal, AppDbContext db, Can
                 x.Group.Id,
                 x.Group.Name,
                 x.Group.IconKey,
+                x.Group.Color,
                 x.Group.CreatedAt,
                 x.Member.Role,
-                MemberCount = members.Count()
+                MemberCount = members.Count(),
+                OwnerDisplay = members
+                    .Where(member => member.Role == UserGroupRole.Owner)
+                    .Join(db.Users,
+                        member => member.UserId,
+                        user => user.Id,
+                        (member, user) => user.Username)
+                    .FirstOrDefault()
             })
         .OrderBy(g => g.Name)
         .Select(g => new GroupResponse(
             g.Id,
             g.Name,
             g.IconKey ?? "other",
+            g.Color,
             g.Role == UserGroupRole.Member ? "member" : g.Role == UserGroupRole.Viewer ? "viewer" : "owner",
             g.CreatedAt,
-            g.MemberCount))
+            g.MemberCount,
+            g.OwnerDisplay))
         .ToListAsync(ct);
 
     var groups = groupRows
-        .Select(g => g with { IconKey = NormalizeGroupIconKey(g.IconKey) })
+        .Select(g => g with { IconKey = NormalizeGroupIconKey(g.IconKey), Color = NormalizeColor(g.Color) })
         .ToList();
 
     return Results.Ok(groups);
@@ -799,7 +857,8 @@ app.MapPost("/api/groups", async (CreateGroupRequest request, ClaimsPrincipal pr
     var group = new Group
     {
         Name = request.Name.Trim(),
-        IconKey = NormalizeGroupIconKey(request.IconKey)
+        IconKey = NormalizeGroupIconKey(request.IconKey),
+        Color = NormalizeColor(request.Color)
     };
 
     if (string.IsNullOrWhiteSpace(group.Name))
@@ -820,7 +879,10 @@ app.MapPost("/api/groups", async (CreateGroupRequest request, ClaimsPrincipal pr
     db.GroupMembers.Add(member);
     await db.SaveChangesAsync(ct);
 
-    return Results.Created($"/api/groups/{group.Id}", new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), "owner", group.CreatedAt, 1));
+    var creator = await db.Users.FirstOrDefaultAsync(u => u.Id == userId.Value, ct);
+    var ownerDisplay = creator?.Username;
+
+    return Results.Created($"/api/groups/{group.Id}", new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), NormalizeColor(group.Color), "owner", group.CreatedAt, 1, ownerDisplay));
 }).RequireAuthorization();
 
 app.MapPatch("/api/groups/{id:guid}", async (Guid id, UpdateGroupRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -845,10 +907,22 @@ app.MapPatch("/api/groups/{id:guid}", async (Guid id, UpdateGroupRequest request
     {
         group.IconKey = NormalizeGroupIconKey(request.IconKey);
     }
+    if (request.Color is not null)
+    {
+        group.Color = NormalizeColor(request.Color);
+    }
     await db.SaveChangesAsync(ct);
 
     var memberCount = await db.GroupMembers.CountAsync(m => m.GroupId == id, ct);
-    return Results.Ok(new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), "owner", group.CreatedAt, memberCount));
+    var ownerDisplay = await db.GroupMembers
+        .Where(m => m.GroupId == id && m.Role == UserGroupRole.Owner)
+        .Join(db.Users,
+            member => member.UserId,
+            user => user.Id,
+            (member, user) => user.Username)
+        .FirstOrDefaultAsync(ct);
+
+    return Results.Ok(new GroupResponse(group.Id, group.Name, NormalizeGroupIconKey(group.IconKey), NormalizeColor(group.Color), "owner", group.CreatedAt, memberCount, ownerDisplay));
 }).RequireAuthorization();
 
 app.MapGet("/api/groups/{id:guid}/members", async (Guid id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -924,24 +998,6 @@ app.MapDelete("/api/groups/{id:guid}", async (Guid id, ClaimsPrincipal principal
     var group = await db.Groups.FirstOrDefaultAsync(g => g.Id == id, ct);
     if (group is null) return Results.NotFound();
 
-    var bankAccounts = await db.BankAccounts.Where(a => a.GroupId == id).ToListAsync(ct);
-    foreach (var account in bankAccounts)
-    {
-        account.GroupId = null;
-    }
-
-    var savings = await db.Savings.Where(s => s.GroupId == id).ToListAsync(ct);
-    foreach (var saving in savings)
-    {
-        saving.GroupId = null;
-    }
-
-    var transactions = await db.Transactions.Where(t => t.GroupId == id).ToListAsync(ct);
-    foreach (var transaction in transactions)
-    {
-        transaction.GroupId = null;
-    }
-
     var members = await db.GroupMembers.Where(m => m.GroupId == id).ToListAsync(ct);
     db.GroupMembers.RemoveRange(members);
     db.Groups.Remove(group);
@@ -993,16 +1049,29 @@ app.MapDelete("/api/groups/{id:guid}/members/{memberUserId:guid}", async (Guid i
     if (!userId.HasValue) return Results.Unauthorized();
 
     var requester = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == userId.Value, ct);
-    if (requester is null || requester.Role != UserGroupRole.Owner) return Results.NotFound();
-
-    if (memberUserId == userId.Value)
-    {
-        return Results.BadRequest(new { message = "You cannot remove yourself from the group here." });
-    }
+    if (requester is null) return Results.NotFound();
 
     var member = await db.GroupMembers.FirstOrDefaultAsync(m => m.GroupId == id && m.UserId == memberUserId, ct);
     if (member is null) return Results.NotFound();
+
+    if (memberUserId == userId.Value)
+    {
+        if (member.Role == UserGroupRole.Owner)
+        {
+            return Results.BadRequest(new { message = "Transfer ownership before leaving the group." });
+        }
+
+        await DeleteOwnedGroupAccessAsync(db, id, userId.Value, ct);
+
+        db.GroupMembers.Remove(member);
+        await db.SaveChangesAsync(ct);
+        return Results.NoContent();
+    }
+
+    if (requester.Role != UserGroupRole.Owner) return Results.NotFound();
     if (member.Role == UserGroupRole.Owner) return Results.BadRequest(new { message = "Transfer ownership before removing the owner." });
+
+    await DeleteOwnedGroupAccessAsync(db, id, memberUserId, ct);
 
     db.GroupMembers.Remove(member);
     await db.SaveChangesAsync(ct);
@@ -1014,27 +1083,37 @@ app.MapGet("/api/logs/me", async (ClaimsPrincipal principal, AppDbContext db, Ca
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var groupUserIds = await db.GroupMembers
+    var isAdmin = await db.Users
         .AsNoTracking()
-        .Where(m => db.GroupMembers.Any(my => my.GroupId == m.GroupId && my.UserId == userId.Value))
-        .Select(m => m.UserId)
-        .Distinct()
-        .ToListAsync(ct);
+        .AnyAsync(u => u.Id == userId.Value && u.Role == UserRole.Admin && u.IsActive, ct);
 
-    if (!groupUserIds.Contains(userId.Value))
+    var logsQuery = db.AuditLogs
+        .AsNoTracking()
+        .AsQueryable();
+
+    if (!isAdmin)
     {
-        groupUserIds.Add(userId.Value);
+        var groupUserIds = await db.GroupMembers
+            .AsNoTracking()
+            .Where(m => db.GroupMembers.Any(my => my.GroupId == m.GroupId && my.UserId == userId.Value))
+            .Select(m => m.UserId)
+            .Distinct()
+            .ToListAsync(ct);
+
+        if (!groupUserIds.Contains(userId.Value))
+        {
+            groupUserIds.Add(userId.Value);
+        }
+
+        logsQuery = logsQuery.Where(l => l.UserId != null && groupUserIds.Contains(l.UserId.Value));
     }
 
-    var logs = await db.AuditLogs
-        .AsNoTracking()
-        .Where(l => l.UserId != null && groupUserIds.Contains(l.UserId.Value))
+    var logs = await logsQuery
         .GroupJoin(db.Users,
             l => l.UserId,
             u => u.Id,
             (log, users) => new { log, user = users.FirstOrDefault() })
         .OrderByDescending(x => x.log.CreatedAt)
-        .Take(100)
         .Select(x => new AuditLogResponse(
             x.log.Id,
             x.log.UserId,
@@ -1060,6 +1139,14 @@ app.MapPost("/api/auth/register", async (
     var usernameLower = username.ToLowerInvariant();
     var email = request.Email.Trim().ToLowerInvariant();
 
+    await using var registrationTx = await db.Database.BeginTransactionAsync(ct);
+    await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock(7301985);", ct);
+    var isFirstUser = !await db.Users.AsNoTracking().AnyAsync(ct);
+    if (!isFirstUser && !await IsRegistrationEnabledAsync(app.Environment.ContentRootPath, ct))
+    {
+        return Results.Json(new { message = "Registration is disabled." }, statusCode: StatusCodes.Status403Forbidden);
+    }
+
     var exists = await db.Users.AnyAsync(
         u => u.Email == email || u.Username.ToLower() == usernameLower,
         ct);
@@ -1068,10 +1155,6 @@ app.MapPost("/api/auth/register", async (
     {
         return Results.Conflict(new { message = "User with this username or email already exists." });
     }
-
-    await using var registrationTx = await db.Database.BeginTransactionAsync(ct);
-    await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock(7301985);", ct);
-    var isFirstUser = !await db.Users.AsNoTracking().AnyAsync(ct);
 
     var user = new User
     {
@@ -1246,15 +1329,58 @@ app.MapGet("/api/bank-accounts", async (ClaimsPrincipal principal, AppDbContext 
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var accounts = await db.BankAccounts
+    var ownAccounts = await db.BankAccounts
         .AsNoTracking()
-        .Where(a => a.UserId == userId.Value ||
-            (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value)))
+        .Where(a => a.UserId == userId.Value)
         .OrderByDescending(a => a.IsDefault)
         .ThenBy(a => a.Name)
-        .Select(a => new BankAccountResponse(a.Id, a.UserId, a.GroupId, a.Name, a.Currency, a.Balance, a.IsDefault))
+        .Select(a => new BankAccountResponse(
+            a.Id,
+            a.UserId,
+            null,
+            a.Name,
+            a.Currency,
+            a.Balance,
+            a.IsDefault,
+            null,
+            null,
+            db.Users
+                .Where(u => u.Id == a.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
         .ToListAsync(ct);
 
+    var sharedAccounts = await db.GroupResourceAccess
+        .AsNoTracking()
+        .Where(access => access.AccountId != null &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+        .Join(db.BankAccounts,
+            access => access.AccountId!.Value,
+            account => account.Id,
+            (access, account) => new { access, account })
+        .Join(db.Groups,
+            x => x.access.GroupId,
+            group => group.Id,
+            (x, group) => new { x.access, x.account, group })
+        .OrderByDescending(x => x.account.IsDefault)
+        .ThenBy(x => x.account.Name)
+        .Select(x => new BankAccountResponse(
+            x.account.Id,
+            x.account.UserId,
+            x.access.GroupId,
+            x.account.Name,
+            x.account.Currency,
+            x.account.Balance,
+            x.account.IsDefault,
+            x.group.Name,
+            x.group.Color,
+            db.Users
+                .Where(u => u.Id == x.account.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
+        .ToListAsync(ct);
+
+    var accounts = ownAccounts.Concat(sharedAccounts).ToList();
     return Results.Ok(accounts);
 }).RequireAuthorization();
 
@@ -1266,8 +1392,26 @@ app.MapGet("/api/bank-accounts/{id:guid}", async (Guid id, ClaimsPrincipal princ
     var account = await db.BankAccounts
         .AsNoTracking()
         .Where(a => a.Id == id && (a.UserId == userId.Value ||
-            (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value))))
-        .Select(a => new BankAccountResponse(a.Id, a.UserId, a.GroupId, a.Name, a.Currency, a.Balance, a.IsDefault))
+            db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))))
+        .Select(a => new BankAccountResponse(
+            a.Id,
+            a.UserId,
+            db.GroupResourceAccess
+                .Where(access => access.AccountId == a.Id &&
+                    db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+                .Select(access => (Guid?)access.GroupId)
+                .FirstOrDefault(),
+            a.Name,
+            a.Currency,
+            a.Balance,
+            a.IsDefault,
+            null,
+            null,
+            db.Users
+                .Where(u => u.Id == a.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
         .FirstOrDefaultAsync(ct);
 
     return account is null ? Results.NotFound() : Results.Ok(account);
@@ -1296,12 +1440,15 @@ app.MapPost("/api/bank-accounts", async (CreateBankAccountRequest request, Claim
         Currency = request.Currency.Trim().ToUpperInvariant(),
         Balance = request.Balance,
         IsDefault = request.IsDefault,
-        GroupId = request.GroupId
     };
 
     db.BankAccounts.Add(account);
     await db.SaveChangesAsync(ct);
-    return Results.Created($"/api/bank-accounts/{account.Id}", ToBankAccountResponse(account));
+    if (request.GroupId.HasValue)
+    {
+        await SetAccountGroupAccessAsync(db, account.Id, request.GroupId.Value, userId.Value, ct);
+    }
+    return Results.Created($"/api/bank-accounts/{account.Id}", await ToBankAccountResponseAsync(account, db, ct));
 }).RequireAuthorization();
 
 app.MapPut("/api/bank-accounts/{id:guid}", async (Guid id, UpdateBankAccountRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1310,38 +1457,40 @@ app.MapPut("/api/bank-accounts/{id:guid}", async (Guid id, UpdateBankAccountRequ
     if (!userId.HasValue) return Results.Unauthorized();
 
     var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == id && (a.UserId == userId.Value ||
-        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (account is null) return Results.NotFound();
+    var ownsAccount = account.UserId == userId.Value;
 
-    if (request.IsDefault)
+    if (request.IsDefault && ownsAccount)
     {
         await ClearDefaultBankAccountsAsync(db, userId.Value, ct);
     }
 
-    if (request.GroupId.HasValue)
+    if (ownsAccount && request.GroupId.HasValue)
     {
         var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
         if (!canShare) return Results.NotFound();
     }
 
-    var previousGroupId = account.GroupId;
     account.Name = request.Name.Trim();
     account.Currency = request.Currency.Trim().ToUpperInvariant();
     account.Balance = request.Balance;
-    account.IsDefault = request.IsDefault;
-    account.GroupId = request.GroupId;
-
-    var accountTransactions = await db.Transactions.Where(t => t.AccountId == account.Id).ToListAsync(ct);
-    foreach (var transaction in accountTransactions)
+    if (ownsAccount)
     {
-        if (transaction.GroupId is null || transaction.GroupId == previousGroupId)
-        {
-            transaction.GroupId = request.GroupId;
-        }
+        account.IsDefault = request.IsDefault;
     }
 
     await db.SaveChangesAsync(ct);
-    return Results.Ok(ToBankAccountResponse(account));
+    if (ownsAccount && request.GroupId.HasValue)
+    {
+        await SetAccountGroupAccessAsync(db, account.Id, request.GroupId.Value, userId.Value, ct);
+    }
+    else if (ownsAccount)
+    {
+        await ReplaceAccountGroupAccessAsync(db, account.Id, null, userId.Value, ct);
+    }
+    return Results.Ok(await ToBankAccountResponseAsync(account, db, ct));
 }).RequireAuthorization();
 
 app.MapDelete("/api/bank-accounts/{id:guid}", async (Guid id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1371,16 +1520,32 @@ app.MapPut("/api/bank-accounts/{id:guid}/group", async (Guid id, ShareResourceWi
         if (!canShare) return Results.NotFound();
     }
 
-    account.GroupId = request.GroupId;
-
-    var transactions = await db.Transactions.Where(t => t.AccountId == account.Id).ToListAsync(ct);
-    foreach (var transaction in transactions)
+    if (request.GroupId.HasValue)
     {
-        transaction.GroupId = request.GroupId;
+        await SetAccountGroupAccessAsync(db, account.Id, request.GroupId.Value, userId.Value, ct);
     }
+    else
+    {
+        await ReplaceAccountGroupAccessAsync(db, account.Id, null, userId.Value, ct);
+    }
+    return Results.Ok(await ToBankAccountResponseAsync(account, db, ct));
+}).RequireAuthorization();
 
-    await db.SaveChangesAsync(ct);
-    return Results.Ok(ToBankAccountResponse(account));
+app.MapPut("/api/bank-accounts/{id:guid}/groups", async (Guid id, ReplaceResourceGroupsRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == id && a.UserId == userId.Value, ct);
+    if (account is null) return Results.NotFound();
+
+    var groupIds = request.GroupIds.Distinct().ToArray();
+    var allowedGroupCount = await db.GroupMembers
+        .CountAsync(m => groupIds.Contains(m.GroupId) && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+    if (allowedGroupCount != groupIds.Length) return Results.NotFound();
+
+    await ReplaceAccountGroupAccessesAsync(db, account.Id, groupIds, userId.Value, ct);
+    return Results.Ok(await ToBankAccountResponseAsync(account, db, ct));
 }).RequireAuthorization();
 
 app.MapGet("/api/savings", async (ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1388,16 +1553,60 @@ app.MapGet("/api/savings", async (ClaimsPrincipal principal, AppDbContext db, Ca
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var savings = await db.Savings
+    var ownSavings = await db.Savings
         .AsNoTracking()
-        .Where(s => s.UserId == userId.Value ||
-            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value)))
+        .Where(s => s.UserId == userId.Value)
         .OrderBy(s => s.IsCompleted)
         .ThenBy(s => s.Deadline)
         .ThenBy(s => s.Name)
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.Currency, s.IconKey, s.Color, s.IsCompleted))
+        .Select(s => new SavingResponse(
+            s.Id,
+            s.UserId,
+            null,
+            s.Name,
+            s.TargetAmount,
+            s.CurrentAmount,
+            s.Deadline,
+            s.Currency,
+            s.IconKey,
+            s.Color,
+            s.IsCompleted,
+            db.Users
+                .Where(u => u.Id == s.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
         .ToListAsync(ct);
 
+    var sharedSavings = await db.GroupResourceAccess
+        .AsNoTracking()
+        .Where(access => access.SavingId != null &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+        .Join(db.Savings,
+            access => access.SavingId!.Value,
+            saving => saving.Id,
+            (access, saving) => new { access, saving })
+        .OrderBy(x => x.saving.IsCompleted)
+        .ThenBy(x => x.saving.Deadline)
+        .ThenBy(x => x.saving.Name)
+        .Select(x => new SavingResponse(
+            x.saving.Id,
+            x.saving.UserId,
+            x.access.GroupId,
+            x.saving.Name,
+            x.saving.TargetAmount,
+            x.saving.CurrentAmount,
+            x.saving.Deadline,
+            x.saving.Currency,
+            x.saving.IconKey,
+            x.saving.Color,
+            x.saving.IsCompleted,
+            db.Users
+                .Where(u => u.Id == x.saving.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
+        .ToListAsync(ct);
+
+    var savings = ownSavings.Concat(sharedSavings).ToList();
     return Results.Ok(savings);
 }).RequireAuthorization();
 
@@ -1409,8 +1618,28 @@ app.MapGet("/api/savings/{id:int}", async (int id, ClaimsPrincipal principal, Ap
     var saving = await db.Savings
         .AsNoTracking()
         .Where(s => s.Id == id && (s.UserId == userId.Value ||
-            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))))
-        .Select(s => new SavingResponse(s.Id, s.UserId, s.GroupId, s.Name, s.TargetAmount, s.CurrentAmount, s.Deadline, s.Currency, s.IconKey, s.Color, s.IsCompleted))
+            db.GroupResourceAccess.Any(access => access.SavingId == s.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))))
+        .Select(s => new SavingResponse(
+            s.Id,
+            s.UserId,
+            db.GroupResourceAccess
+                .Where(access => access.SavingId == s.Id &&
+                    db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+                .Select(access => (Guid?)access.GroupId)
+                .FirstOrDefault(),
+            s.Name,
+            s.TargetAmount,
+            s.CurrentAmount,
+            s.Deadline,
+            s.Currency,
+            s.IconKey,
+            s.Color,
+            s.IsCompleted,
+            db.Users
+                .Where(u => u.Id == s.UserId)
+                .Select(u => u.Username)
+                .FirstOrDefault()))
         .FirstOrDefaultAsync(ct);
 
     return saving is null ? Results.NotFound() : Results.Ok(saving);
@@ -1445,7 +1674,8 @@ app.MapPut("/api/savings/{id:int}", async (int id, UpdateSavingRequest request, 
     if (!userId.HasValue) return Results.Unauthorized();
 
     var saving = await db.Savings.FirstOrDefaultAsync(s => s.Id == id && (s.UserId == userId.Value ||
-        (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.SavingId == s.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (saving is null) return Results.NotFound();
 
     saving.Name = request.Name.Trim();
@@ -1488,8 +1718,31 @@ app.MapPut("/api/savings/{id:int}/group", async (int id, ShareResourceWithGroupR
         if (!canShare) return Results.NotFound();
     }
 
-    saving.GroupId = request.GroupId;
-    await db.SaveChangesAsync(ct);
+    if (request.GroupId.HasValue)
+    {
+        await SetSavingGroupAccessAsync(db, saving.Id, request.GroupId.Value, userId.Value, ct);
+    }
+    else
+    {
+        await ReplaceSavingGroupAccessAsync(db, saving.Id, null, userId.Value, ct);
+    }
+    return Results.Ok(ToSavingResponse(saving));
+}).RequireAuthorization();
+
+app.MapPut("/api/savings/{id:int}/groups", async (int id, ReplaceResourceGroupsRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var saving = await db.Savings.FirstOrDefaultAsync(s => s.Id == id && s.UserId == userId.Value, ct);
+    if (saving is null) return Results.NotFound();
+
+    var groupIds = request.GroupIds.Distinct().ToArray();
+    var allowedGroupCount = await db.GroupMembers
+        .CountAsync(m => groupIds.Contains(m.GroupId) && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+    if (allowedGroupCount != groupIds.Length) return Results.NotFound();
+
+    await ReplaceSavingGroupAccessesAsync(db, saving.Id, groupIds, userId.Value, ct);
     return Results.Ok(ToSavingResponse(saving));
 }).RequireAuthorization();
 
@@ -1498,8 +1751,7 @@ app.MapGet("/api/savings/{savingId:int}/items", async (int savingId, ClaimsPrinc
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var ownsSaving = await db.Savings.AnyAsync(s => s.Id == savingId && (s.UserId == userId.Value ||
-        (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value))), ct);
+    var ownsSaving = await CanUseSavingAsync(db, savingId, userId.Value, requireManage: false, ct);
     if (!ownsSaving) return Results.NotFound();
 
     var items = await db.SavingItems
@@ -1518,8 +1770,7 @@ app.MapPost("/api/savings/{savingId:int}/items", async (int savingId, CreateSavi
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var ownsSaving = await db.Savings.AnyAsync(s => s.Id == savingId && (s.UserId == userId.Value ||
-        (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    var ownsSaving = await CanUseSavingAsync(db, savingId, userId.Value, requireManage: true, ct);
     if (!ownsSaving) return Results.NotFound();
 
     var item = new SavingItem
@@ -1541,8 +1792,7 @@ app.MapPut("/api/savings/{savingId:int}/items/{itemId:int}", async (int savingId
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var ownsSaving = await db.Savings.AnyAsync(s => s.Id == savingId && (s.UserId == userId.Value ||
-        (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    var ownsSaving = await CanUseSavingAsync(db, savingId, userId.Value, requireManage: true, ct);
     if (!ownsSaving) return Results.NotFound();
 
     var item = await db.SavingItems.FirstOrDefaultAsync(i => i.Id == itemId && i.SavingId == savingId, ct);
@@ -1562,8 +1812,7 @@ app.MapDelete("/api/savings/{savingId:int}/items/{itemId:int}", async (int savin
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var ownsSaving = await db.Savings.AnyAsync(s => s.Id == savingId && (s.UserId == userId.Value ||
-        (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+    var ownsSaving = await CanUseSavingAsync(db, savingId, userId.Value, requireManage: true, ct);
     if (!ownsSaving) return Results.NotFound();
 
     var item = await db.SavingItems.FirstOrDefaultAsync(i => i.Id == itemId && i.SavingId == savingId, ct);
@@ -1579,10 +1828,9 @@ app.MapGet("/api/planned-transactions", async (ClaimsPrincipal principal, AppDbC
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var transactionRows = await db.Transactions
+    var ownTransactionRows = await db.Transactions
         .AsNoTracking()
-        .Where(t => t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
+        .Where(t => t.RecurringPaymentId != null && t.Account != null && t.Account.UserId == userId.Value)
         .OrderBy(t => t.TransactionDate)
         .Join(db.ScheduledPayments,
             t => t.RecurringPaymentId!.Value,
@@ -1591,32 +1839,77 @@ app.MapGet("/api/planned-transactions", async (ClaimsPrincipal principal, AppDbC
             {
                 t.Id,
                 t.AccountId,
+                GroupId = (Guid?)null,
+                GroupName = (string?)null,
                 t.CategoryId,
                 RecurringPaymentId = p.Id,
                 p.Name,
                 t.Amount,
                 t.Description,
                 t.TransactionDate,
-                p.RepeatInterval,
                 p.NextDueDate,
-                p.IsActive
+                p.IsActive,
+                Currency = t.Account != null ? t.Account.Currency : null,
+                OwnerDisplay = t.Account != null && t.Account.User != null && t.Account.User.IsActive
+                    ? t.Account.User.Username
+                    : null
+        })
+        .ToListAsync(ct);
+
+    var sharedTransactionRows = await db.GroupResourceAccess
+        .AsNoTracking()
+        .Where(access => access.TransactionId != null &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+        .Join(db.Transactions,
+            access => access.TransactionId!.Value,
+            transaction => transaction.Id,
+            (access, transaction) => new { access, transaction })
+        .Where(x => x.transaction.RecurringPaymentId != null)
+        .Join(db.ScheduledPayments,
+            x => x.transaction.RecurringPaymentId!.Value,
+            payment => payment.Id,
+            (x, payment) => new
+            {
+                x.transaction.Id,
+                x.transaction.AccountId,
+                GroupId = (Guid?)x.access.GroupId,
+                GroupName = x.access.Group != null ? x.access.Group.Name : null,
+                x.transaction.CategoryId,
+                RecurringPaymentId = payment.Id,
+                payment.Name,
+                x.transaction.Amount,
+                x.transaction.Description,
+                x.transaction.TransactionDate,
+                payment.NextDueDate,
+                payment.IsActive,
+                Currency = x.transaction.Account != null ? x.transaction.Account.Currency : null,
+                OwnerDisplay = x.transaction.Account != null && x.transaction.Account.User != null && x.transaction.Account.User.IsActive
+                    ? x.transaction.Account.User.Username
+                    : null
             })
         .ToListAsync(ct);
 
-    var transactions = transactionRows
-        .Select(x => new PlannedTransactionResponse(
+    var transactions = new List<PlannedTransactionResponse>();
+    foreach (var x in ownTransactionRows.Concat(sharedTransactionRows))
+    {
+        var repeatInterval = await GetRepeatIntervalAsync(db, x.RecurringPaymentId, ct);
+        transactions.Add(new PlannedTransactionResponse(
             x.Id,
             x.AccountId,
+            x.GroupId,
+            x.GroupName,
             x.CategoryId,
             x.RecurringPaymentId,
             x.Name,
             x.Amount,
             x.Description,
             x.TransactionDate,
-            x.RepeatInterval,
+            repeatInterval,
             ToDateOnly(x.NextDueDate),
-            x.IsActive))
-        .ToList();
+            x.IsActive,
+            x.OwnerDisplay,
+            x.Currency));
+    }
 
     return Results.Ok(transactions);
 }).RequireAuthorization();
@@ -1627,30 +1920,28 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
     if (!userId.HasValue) return Results.Unauthorized();
 
     var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
-        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     var ownsAccount = account is not null;
     if (!ownsAccount) return Results.BadRequest(new { message = "Account does not exist." });
 
     var hasCategory = await db.Categories.AnyAsync(c => c.Id == request.CategoryId, ct);
     if (!hasCategory) return Results.BadRequest(new { message = "Category does not exist." });
-
-    var payment = new ScheduledPayment
+    if (request.GroupId.HasValue)
     {
-        Name = request.Name.Trim(),
-        RepeatInterval = request.RepeatInterval,
-        NextDueDate = ToUtcDateTimeOffset(request.NextDueDate),
-        IsActive = true
-    };
+        var canShare = await db.GroupMembers.AnyAsync(
+            m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer,
+            ct);
+        if (!canShare) return Results.NotFound();
+    }
 
-    db.ScheduledPayments.Add(payment);
-    await db.SaveChangesAsync(ct);
+    var paymentId = await InsertScheduledPaymentAsync(db, request.Name.Trim(), request.RepeatInterval, ToUtcDateTimeOffset(request.NextDueDate), ct);
 
     var transaction = new Transaction
     {
         AccountId = request.AccountId,
-        GroupId = account!.GroupId,
         CategoryId = request.CategoryId,
-        RecurringPaymentId = payment.Id,
+        RecurringPaymentId = paymentId,
         Amount = request.Amount,
         Description = string.IsNullOrWhiteSpace(request.Description) ? request.Name.Trim() : request.Description.Trim(),
         TransactionDate = new DateTimeOffset(request.NextDueDate.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)
@@ -1658,6 +1949,10 @@ app.MapPost("/api/planned-transactions", async (CreatePlannedTransactionRequest 
 
     db.Transactions.Add(transaction);
     await db.SaveChangesAsync(ct);
+    if (request.GroupId.HasValue)
+    {
+        await SetTransactionGroupAccessAsync(db, transaction.Id, request.GroupId.Value, userId.Value, ct);
+    }
     return Results.Created($"/api/planned-transactions/{transaction.Id}", ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
@@ -1669,37 +1964,60 @@ app.MapPut("/api/planned-transactions/{id:int}", async (int id, CreatePlannedTra
     var transaction = await db.Transactions
         .Include(t => t.Account)
         .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer)) ||
+            db.GroupResourceAccess.Any(access => access.AccountId == t.AccountId &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transaction is null) return Results.NotFound();
+    var ownsTransaction = transaction.Account!.UserId == userId.Value;
+    if (!ownsTransaction && transaction.AccountId != request.AccountId)
+    {
+        return Results.BadRequest(new { message = "Only the owner can move this transaction to another account." });
+    }
 
     var account = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
-        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (account is null) return Results.BadRequest(new { message = "Account does not exist." });
 
     var hasCategory = await db.Categories.AnyAsync(c => c.Id == request.CategoryId, ct);
     if (!hasCategory) return Results.BadRequest(new { message = "Category does not exist." });
+    if (ownsTransaction && request.GroupId.HasValue)
+    {
+        var canShare = await db.GroupMembers.AnyAsync(
+            m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer,
+            ct);
+        if (!canShare) return Results.NotFound();
+    }
 
     var recurringPaymentId = transaction.RecurringPaymentId!.Value;
     var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);
     if (payment is null) return Results.NotFound();
 
     payment.Name = request.Name.Trim();
-    payment.RepeatInterval = request.RepeatInterval;
     payment.NextDueDate = ToUtcDateTimeOffset(request.NextDueDate);
     payment.IsActive = true;
+    await UpdateScheduledPaymentIntervalAsync(db, payment.Id, request.RepeatInterval, ct);
 
     transaction.AccountId = request.AccountId;
-    transaction.GroupId = account.GroupId;
     transaction.CategoryId = request.CategoryId;
     transaction.Amount = request.Amount;
     transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? request.Name.Trim() : request.Description.Trim();
     transaction.TransactionDate = ToUtcDateTimeOffset(request.NextDueDate);
 
     await db.SaveChangesAsync(ct);
+    if (ownsTransaction && request.GroupId.HasValue)
+    {
+        await SetTransactionGroupAccessAsync(db, transaction.Id, request.GroupId.Value, userId.Value, ct);
+    }
+    else if (ownsTransaction)
+    {
+        await ReplaceTransactionGroupAccessAsync(db, transaction.Id, null, userId.Value, ct);
+    }
     return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
-app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ConfirmPlannedTransactionRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
 {
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
@@ -1707,8 +2025,15 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
     var transaction = await db.Transactions
         .Include(t => t.Account)
         .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value)) ||
+            db.GroupResourceAccess.Any(access => access.AccountId == t.AccountId &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))), ct);
     if (transaction is null) return Results.NotFound();
+
+    var targetAccount = await db.BankAccounts
+        .FirstOrDefaultAsync(a => a.Id == request.AccountId && a.UserId == userId.Value, ct);
+    if (targetAccount is null) return Results.NotFound();
 
     var recurringPaymentId = transaction.RecurringPaymentId!.Value;
     var payment = await db.ScheduledPayments.FirstOrDefaultAsync(p => p.Id == recurringPaymentId, ct);
@@ -1720,30 +2045,36 @@ app.MapPost("/api/planned-transactions/{id:int}/confirm", async (int id, ClaimsP
         return Results.Ok(ToTransactionResponse(transaction));
     }
 
-    if (payment.RepeatInterval > TimeSpan.Zero)
+    var repeatInterval = await GetRepeatIntervalAsync(db, payment.Id, ct);
+    if (repeatInterval > TimeSpan.Zero)
     {
-        var nextDueDate = AddRepeatInterval(ToDateOnly(payment.NextDueDate), payment.RepeatInterval);
+        var nextDueDate = AddRepeatInterval(ToDateOnly(payment.NextDueDate), repeatInterval);
         payment.NextDueDate = ToUtcDateTimeOffset(nextDueDate);
-        db.Transactions.Add(new Transaction
+
+        var paidTransaction = new Transaction
         {
-            AccountId = transaction.AccountId,
-            GroupId = transaction.GroupId,
+            AccountId = targetAccount.Id,
             CategoryId = transaction.CategoryId,
-            RecurringPaymentId = payment.Id,
             Amount = transaction.Amount,
             Description = transaction.Description,
-            TransactionDate = ToUtcDateTimeOffset(nextDueDate)
-        });
+            TransactionDate = DateTimeOffset.UtcNow
+        };
+        db.Transactions.Add(paidTransaction);
+
+        transaction.TransactionDate = ToUtcDateTimeOffset(nextDueDate);
+        await db.SaveChangesAsync(ct);
+        return Results.Ok(ToTransactionResponse(paidTransaction));
     }
     else
     {
         payment.IsActive = false;
-    }
 
-    transaction.RecurringPaymentId = null;
-    transaction.TransactionDate = DateTimeOffset.UtcNow;
-    await db.SaveChangesAsync(ct);
-    return Results.Ok(ToTransactionResponse(transaction));
+        transaction.RecurringPaymentId = null;
+        transaction.AccountId = targetAccount.Id;
+        transaction.TransactionDate = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+        return Results.Ok(ToTransactionResponse(transaction));
+    }
 }).RequireAuthorization();
 
 app.MapDelete("/api/planned-transactions/{id:int}", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
@@ -1754,7 +2085,10 @@ app.MapDelete("/api/planned-transactions/{id:int}", async (int id, ClaimsPrincip
     var transaction = await db.Transactions
         .Include(t => t.Account)
         .FirstOrDefaultAsync(t => t.Id == id && t.RecurringPaymentId != null && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer)) ||
+            db.GroupResourceAccess.Any(access => access.AccountId == t.AccountId &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transaction is null) return Results.NotFound();
 
     var recurringPaymentId = transaction.RecurringPaymentId!.Value;
@@ -1780,18 +2114,16 @@ app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext d
     var userId = GetUserIdFromPrincipal(principal);
     if (!userId.HasValue) return Results.Unauthorized();
 
-    var transactions = await db.Transactions
+    var ownTransactions = await db.Transactions
         .AsNoTracking()
-        .Where(t => t.RecurringPaymentId == null && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.GroupId && m.UserId == userId.Value)) ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
+        .Where(t => t.RecurringPaymentId == null && t.Account != null && t.Account.UserId == userId.Value)
         .OrderByDescending(t => t.TransactionDate)
         .Select(t => new TransactionResponse(
             t.Id,
             t.AccountId,
-            t.GroupId,
-            t.Group != null ? t.Group.Name : null,
-            t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
+            null,
+            null,
+            t.Account != null && t.Account.User != null && t.Account.User.IsActive ? t.Account.User.Username : null,
             t.CategoryId,
             t.SavingId,
             t.RecurringPaymentId,
@@ -1800,6 +2132,69 @@ app.MapGet("/api/transactions", async (ClaimsPrincipal principal, AppDbContext d
             t.TransactionDate))
         .ToListAsync(ct);
 
+    var sharedTransactions = await db.GroupResourceAccess
+        .AsNoTracking()
+        .Where(access => access.TransactionId != null &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+        .Join(db.Transactions,
+            access => access.TransactionId!.Value,
+            transaction => transaction.Id,
+            (access, transaction) => new { access, transaction })
+        .Join(db.Groups,
+            x => x.access.GroupId,
+            group => group.Id,
+            (x, group) => new { x.access, x.transaction, group })
+        .Where(x => x.transaction.RecurringPaymentId == null)
+        .OrderByDescending(x => x.transaction.TransactionDate)
+        .Select(x => new TransactionResponse(
+            x.transaction.Id,
+            x.transaction.AccountId,
+            x.access.GroupId,
+            x.group.Name,
+            x.transaction.Account != null && x.transaction.Account.User != null && x.transaction.Account.User.IsActive ? x.transaction.Account.User.Username : null,
+            x.transaction.CategoryId,
+            x.transaction.SavingId,
+            x.transaction.RecurringPaymentId,
+            x.transaction.Amount,
+            x.transaction.Description,
+            x.transaction.TransactionDate))
+        .ToListAsync(ct);
+
+    var sharedSavingTransactions = await db.GroupResourceAccess
+        .AsNoTracking()
+        .Where(access => access.SavingId != null &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+        .Join(db.Transactions,
+            access => access.SavingId!.Value,
+            transaction => transaction.SavingId,
+            (access, transaction) => new { access, transaction })
+        .Join(db.Groups,
+            x => x.access.GroupId,
+            group => group.Id,
+            (x, group) => new { x.access, x.transaction, group })
+        .Where(x => x.transaction.RecurringPaymentId == null)
+        .OrderByDescending(x => x.transaction.TransactionDate)
+        .Select(x => new TransactionResponse(
+            x.transaction.Id,
+            x.transaction.AccountId,
+            x.access.GroupId,
+            x.group.Name,
+            x.transaction.Account != null && x.transaction.Account.User != null && x.transaction.Account.User.IsActive ? x.transaction.Account.User.Username : null,
+            x.transaction.CategoryId,
+            x.transaction.SavingId,
+            x.transaction.RecurringPaymentId,
+            x.transaction.Amount,
+            x.transaction.Description,
+            x.transaction.TransactionDate))
+        .ToListAsync(ct);
+
+    var transactions = ownTransactions
+        .Concat(sharedTransactions)
+        .Concat(sharedSavingTransactions)
+        .GroupBy(t => t.Id)
+        .Select(g => g.First())
+        .OrderByDescending(t => t.TransactionDate)
+        .ToList();
     return Results.Ok(transactions);
 }).RequireAuthorization();
 
@@ -1811,14 +2206,20 @@ app.MapGet("/api/transactions/{id:int}", async (int id, ClaimsPrincipal principa
     var transaction = await db.Transactions
         .AsNoTracking()
         .Where(t => t.Id == id && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.GroupId && m.UserId == userId.Value)) ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value))))
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value)) ||
+            db.GroupResourceAccess.Any(access => access.AccountId == t.AccountId &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))))
         .Select(t => new TransactionResponse(
             t.Id,
             t.AccountId,
-            t.GroupId,
-            t.Group != null ? t.Group.Name : null,
-            t.Account != null && t.Account.User != null ? t.Account.User.Username : null,
+            db.GroupResourceAccess
+                .Where(access => access.TransactionId == t.Id &&
+                    db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value))
+                .Select(access => (Guid?)access.GroupId)
+                .FirstOrDefault(),
+            null,
+            t.Account != null && t.Account.User != null && t.Account.User.IsActive ? t.Account.User.Username : null,
             t.CategoryId,
             t.SavingId,
             t.RecurringPaymentId,
@@ -1836,7 +2237,8 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
     if (!userId.HasValue) return Results.Unauthorized();
 
     var transactionAccount = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
-        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transactionAccount is null) return Results.BadRequest(new { message = "Account does not exist." });
 
     if (request.GroupId.HasValue)
@@ -1847,15 +2249,13 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
 
     if (request.SavingId.HasValue)
     {
-        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
-            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        var canUseSaving = await CanUseSavingAsync(db, request.SavingId.Value, userId.Value, requireManage: true, ct);
         if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
     }
 
     var transaction = new Transaction
     {
         AccountId = request.AccountId,
-        GroupId = request.GroupId ?? transactionAccount.GroupId,
         CategoryId = request.CategoryId,
         SavingId = request.SavingId,
         RecurringPaymentId = request.RecurringPaymentId,
@@ -1866,6 +2266,10 @@ app.MapPost("/api/transactions", async (CreateTransactionRequest request, Claims
 
     db.Transactions.Add(transaction);
     await db.SaveChangesAsync(ct);
+    if (request.GroupId.HasValue)
+    {
+        await SetTransactionGroupAccessAsync(db, transaction.Id, request.GroupId.Value, userId.Value, ct);
+    }
     return Results.Created($"/api/transactions/{transaction.Id}", ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
@@ -1877,14 +2281,23 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
     var transaction = await db.Transactions
         .Include(t => t.Account)
         .FirstOrDefaultAsync(t => t.Id == id && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer)) ||
+            db.GroupResourceAccess.Any(access => access.AccountId == t.AccountId &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transaction is null) return Results.NotFound();
+    var ownsTransaction = transaction.Account!.UserId == userId.Value;
+    if (!ownsTransaction && transaction.AccountId != request.AccountId)
+    {
+        return Results.BadRequest(new { message = "Only the owner can move this transaction to another account." });
+    }
 
     var targetAccount = await db.BankAccounts.FirstOrDefaultAsync(a => a.Id == request.AccountId && (a.UserId == userId.Value ||
-        (a.GroupId != null && db.GroupMembers.Any(m => m.GroupId == a.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        db.GroupResourceAccess.Any(access => access.AccountId == a.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (targetAccount is null) return Results.BadRequest(new { message = "Account does not exist." });
 
-    if (request.GroupId.HasValue)
+    if (ownsTransaction && request.GroupId.HasValue)
     {
         var canShare = await db.GroupMembers.AnyAsync(m => m.GroupId == request.GroupId.Value && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
         if (!canShare) return Results.NotFound();
@@ -1892,13 +2305,11 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
 
     if (request.SavingId.HasValue)
     {
-        var canUseSaving = await db.Savings.AnyAsync(s => s.Id == request.SavingId.Value && (s.UserId == userId.Value ||
-            (s.GroupId != null && db.GroupMembers.Any(m => m.GroupId == s.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+        var canUseSaving = await CanUseSavingAsync(db, request.SavingId.Value, userId.Value, requireManage: true, ct);
         if (!canUseSaving) return Results.BadRequest(new { message = "Saving does not exist." });
     }
 
     transaction.AccountId = request.AccountId;
-    transaction.GroupId = request.GroupId ?? targetAccount.GroupId;
     transaction.CategoryId = request.CategoryId;
     transaction.SavingId = request.SavingId;
     transaction.RecurringPaymentId = request.RecurringPaymentId;
@@ -1906,6 +2317,33 @@ app.MapPut("/api/transactions/{id:int}", async (int id, UpdateTransactionRequest
     transaction.Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim();
     transaction.TransactionDate = request.TransactionDate.ToUniversalTime();
     await db.SaveChangesAsync(ct);
+    if (ownsTransaction && request.GroupId.HasValue)
+    {
+        await SetTransactionGroupAccessAsync(db, transaction.Id, request.GroupId.Value, userId.Value, ct);
+    }
+    else if (ownsTransaction)
+    {
+        await ReplaceTransactionGroupAccessAsync(db, transaction.Id, null, userId.Value, ct);
+    }
+    return Results.Ok(ToTransactionResponse(transaction));
+}).RequireAuthorization();
+
+app.MapPut("/api/transactions/{id:int}/groups", async (int id, ReplaceResourceGroupsRequest request, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+{
+    var userId = GetUserIdFromPrincipal(principal);
+    if (!userId.HasValue) return Results.Unauthorized();
+
+    var transaction = await db.Transactions
+        .Include(t => t.Account)
+        .FirstOrDefaultAsync(t => t.Id == id && t.Account != null && t.Account.UserId == userId.Value, ct);
+    if (transaction is null) return Results.NotFound();
+
+    var groupIds = request.GroupIds.Distinct().ToArray();
+    var allowedGroupCount = await db.GroupMembers
+        .CountAsync(m => groupIds.Contains(m.GroupId) && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer, ct);
+    if (allowedGroupCount != groupIds.Length) return Results.NotFound();
+
+    await ReplaceTransactionGroupAccessesAsync(db, transaction.Id, groupIds, userId.Value, ct);
     return Results.Ok(ToTransactionResponse(transaction));
 }).RequireAuthorization();
 
@@ -1917,7 +2355,8 @@ app.MapDelete("/api/transactions/{id:int}", async (int id, ClaimsPrincipal princ
     var transaction = await db.Transactions
         .Include(t => t.Account)
         .FirstOrDefaultAsync(t => t.Id == id && t.Account != null && (t.Account.UserId == userId.Value ||
-            (t.Account.GroupId != null && db.GroupMembers.Any(m => m.GroupId == t.Account.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
+            db.GroupResourceAccess.Any(access => access.TransactionId == t.Id &&
+                db.GroupMembers.Any(m => m.GroupId == access.GroupId && m.UserId == userId.Value && m.Role != UserGroupRole.Viewer))), ct);
     if (transaction is null) return Results.NotFound();
 
     db.Transactions.Remove(transaction);
@@ -2008,14 +2447,123 @@ static string? NormalizeColor(string? color)
 static string ToRoleName(UserRole role) =>
     role == UserRole.Admin ? "admin" : "user";
 
-static BankAccountResponse ToBankAccountResponse(BankAccount account) =>
-    new(account.Id, account.UserId, account.GroupId, account.Name, account.Currency, account.Balance, account.IsDefault);
+static async Task<BankAccountResponse> ToBankAccountResponseAsync(BankAccount account, AppDbContext db, CancellationToken ct)
+{
+    var sharedBy = await db.Users
+        .AsNoTracking()
+        .Where(u => u.Id == account.UserId)
+                .Select(u => u.IsActive ? u.Username : null)
+        .FirstOrDefaultAsync(ct);
+
+    return new(
+        account.Id,
+        account.UserId,
+        null,
+        account.Name,
+        account.Currency,
+        account.Balance,
+        account.IsDefault,
+        null,
+        null,
+        sharedBy);
+}
 
 static SavingResponse ToSavingResponse(Saving saving) =>
-    new(saving.Id, saving.UserId, saving.GroupId, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Deadline, saving.Currency, saving.IconKey, saving.Color, saving.IsCompleted);
+    new(saving.Id, saving.UserId, null, saving.Name, saving.TargetAmount, saving.CurrentAmount, saving.Deadline, saving.Currency, saving.IconKey, saving.Color, saving.IsCompleted);
 
 static SavingItemResponse ToSavingItemResponse(SavingItem item) =>
     new(item.Id, item.SavingId, item.Name, item.Price, item.Priority, item.IsPurchased);
+
+static async Task<int> InsertScheduledPaymentAsync(
+    AppDbContext db,
+    string name,
+    TimeSpan repeatInterval,
+    DateTimeOffset nextDueDate,
+    CancellationToken ct)
+{
+    var ids = await db.Database.SqlQueryRaw<int>(
+            """
+            INSERT INTO recurring_payments (name, repeat_interval, next_due_date, is_active)
+            VALUES (@name, CAST(@repeat_interval AS interval), @next_due_date, TRUE)
+            RETURNING id AS "Value"
+            """,
+            new NpgsqlParameter("name", name),
+            new NpgsqlParameter("repeat_interval", FormatRepeatIntervalForPostgres(repeatInterval)),
+            new NpgsqlParameter("next_due_date", nextDueDate))
+        .ToListAsync(ct);
+
+    return ids.Single();
+}
+
+static async Task UpdateScheduledPaymentIntervalAsync(
+    AppDbContext db,
+    int scheduledPaymentId,
+    TimeSpan repeatInterval,
+    CancellationToken ct)
+{
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        UPDATE recurring_payments
+        SET repeat_interval = CAST(@repeat_interval AS interval)
+        WHERE id = @id
+        """,
+        [
+            new NpgsqlParameter("repeat_interval", FormatRepeatIntervalForPostgres(repeatInterval)),
+            new NpgsqlParameter("id", scheduledPaymentId)
+        ],
+        ct);
+}
+
+static async Task<TimeSpan> GetRepeatIntervalAsync(AppDbContext db, int scheduledPaymentId, CancellationToken ct)
+{
+    var seconds = await db.Database.SqlQueryRaw<double>(
+            """
+            SELECT (
+                EXTRACT(YEAR FROM repeat_interval) * 365 * 86400
+                + EXTRACT(MONTH FROM repeat_interval) * 30 * 86400
+                + EXTRACT(DAY FROM repeat_interval) * 86400
+                + EXTRACT(HOUR FROM repeat_interval) * 3600
+                + EXTRACT(MINUTE FROM repeat_interval) * 60
+                + EXTRACT(SECOND FROM repeat_interval)
+            )::double precision AS "Value"
+            FROM recurring_payments
+            WHERE id = @id
+            """,
+            new NpgsqlParameter("id", scheduledPaymentId))
+        .FirstOrDefaultAsync(ct);
+
+    return TimeSpan.FromSeconds(seconds);
+}
+
+static string FormatRepeatIntervalForPostgres(TimeSpan repeatInterval)
+{
+    if (repeatInterval <= TimeSpan.Zero)
+    {
+        return "0 seconds";
+    }
+
+    if (repeatInterval == TimeSpan.FromDays(30))
+    {
+        return "1 month";
+    }
+
+    if (repeatInterval == TimeSpan.FromDays(365))
+    {
+        return "1 year";
+    }
+
+    if (repeatInterval == TimeSpan.FromDays(7))
+    {
+        return "7 days";
+    }
+
+    if (repeatInterval == TimeSpan.FromDays(1))
+    {
+        return "1 day";
+    }
+
+    return FormattableString.Invariant($"{repeatInterval.TotalSeconds:0.######} seconds");
+}
 
 static DateOnly AddRepeatInterval(DateOnly dueDate, TimeSpan repeatInterval)
 {
@@ -2035,8 +2583,123 @@ static DateTimeOffset ToUtcDateTimeOffset(DateOnly value) =>
     new(value.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
 
 static TransactionResponse ToTransactionResponse(Transaction transaction) =>
-    new(transaction.Id, transaction.AccountId, transaction.GroupId, transaction.Group?.Name, transaction.Account?.User?.Username, transaction.CategoryId, transaction.SavingId, transaction.RecurringPaymentId, transaction.Amount,
+    new(transaction.Id, transaction.AccountId, null, null, transaction.Account?.User is null || !transaction.Account.User.IsActive
+            ? null
+            : transaction.Account.User.Username, transaction.CategoryId, transaction.SavingId, transaction.RecurringPaymentId, transaction.Amount,
         transaction.Description, transaction.TransactionDate);
+
+static async Task SetAccountGroupAccessAsync(AppDbContext db, Guid accountId, Guid groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"""
+        INSERT INTO group_resource_access (group_id, account_id, shared_by)
+        VALUES ({groupId}, {accountId}, {sharedBy})
+        ON CONFLICT (group_id, account_id) DO UPDATE SET shared_by = EXCLUDED.shared_by;
+        """, ct);
+}
+
+static async Task ReplaceAccountGroupAccessAsync(AppDbContext db, Guid accountId, Guid? groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE account_id = {accountId};", ct);
+    if (groupId.HasValue)
+    {
+        await SetAccountGroupAccessAsync(db, accountId, groupId.Value, sharedBy, ct);
+    }
+}
+
+static async Task SetSavingGroupAccessAsync(AppDbContext db, int savingId, Guid groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"""
+        INSERT INTO group_resource_access (group_id, saving_id, shared_by)
+        VALUES ({groupId}, {savingId}, {sharedBy})
+        ON CONFLICT (group_id, saving_id) DO UPDATE SET shared_by = EXCLUDED.shared_by;
+        """, ct);
+}
+
+static async Task ReplaceSavingGroupAccessAsync(AppDbContext db, int savingId, Guid? groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE saving_id = {savingId};", ct);
+    if (groupId.HasValue)
+    {
+        await SetSavingGroupAccessAsync(db, savingId, groupId.Value, sharedBy, ct);
+    }
+}
+
+static async Task ReplaceSavingGroupAccessesAsync(AppDbContext db, int savingId, IReadOnlyCollection<Guid> groupIds, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE saving_id = {savingId};", ct);
+    foreach (var groupId in groupIds)
+    {
+        await SetSavingGroupAccessAsync(db, savingId, groupId, sharedBy, ct);
+    }
+}
+
+static async Task ReplaceAccountGroupAccessesAsync(AppDbContext db, Guid accountId, IReadOnlyCollection<Guid> groupIds, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE account_id = {accountId};", ct);
+    foreach (var groupId in groupIds)
+    {
+        await SetAccountGroupAccessAsync(db, accountId, groupId, sharedBy, ct);
+    }
+}
+
+static async Task SetTransactionGroupAccessAsync(AppDbContext db, int transactionId, Guid groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"""
+        INSERT INTO group_resource_access (group_id, transaction_id, shared_by)
+        VALUES ({groupId}, {transactionId}, {sharedBy})
+        ON CONFLICT (group_id, transaction_id) DO UPDATE SET shared_by = EXCLUDED.shared_by;
+        """, ct);
+}
+
+static async Task ReplaceTransactionGroupAccessAsync(AppDbContext db, int transactionId, Guid? groupId, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE transaction_id = {transactionId};", ct);
+    if (groupId.HasValue)
+    {
+        await SetTransactionGroupAccessAsync(db, transactionId, groupId.Value, sharedBy, ct);
+    }
+}
+
+static async Task ReplaceTransactionGroupAccessesAsync(AppDbContext db, int transactionId, IReadOnlyCollection<Guid> groupIds, Guid sharedBy, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM group_resource_access WHERE transaction_id = {transactionId};", ct);
+    foreach (var groupId in groupIds)
+    {
+        await SetTransactionGroupAccessAsync(db, transactionId, groupId, sharedBy, ct);
+    }
+}
+
+static async Task<bool> CanUseSavingAsync(AppDbContext db, int savingId, Guid userId, bool requireManage, CancellationToken ct) =>
+    await db.Savings.AnyAsync(s => s.Id == savingId && (s.UserId == userId ||
+        db.GroupResourceAccess.Any(access => access.SavingId == s.Id &&
+            db.GroupMembers.Any(m => m.GroupId == access.GroupId &&
+                m.UserId == userId &&
+                (!requireManage || m.Role != UserGroupRole.Viewer)))), ct);
+
+static async Task DeleteOwnedGroupAccessAsync(AppDbContext db, Guid groupId, Guid ownerUserId, CancellationToken ct)
+{
+    await db.Database.ExecuteSqlInterpolatedAsync($"""
+        DELETE FROM group_resource_access access
+        USING accounts account
+        WHERE access.group_id = {groupId}
+          AND access.account_id = account.id
+          AND account.user_id = {ownerUserId};
+
+        DELETE FROM group_resource_access access
+        USING savings saving
+        WHERE access.group_id = {groupId}
+          AND access.saving_id = saving.id
+          AND saving.user_id = {ownerUserId};
+
+        DELETE FROM group_resource_access access
+        USING transactions tx
+        JOIN accounts account ON account.id = tx.account_id
+        WHERE access.group_id = {groupId}
+          AND access.transaction_id = tx.id
+          AND account.user_id = {ownerUserId}
+          AND tx.recurring_payments_id IS NOT NULL;
+        """, ct);
+}
 
 static BudgetResponse ToBudgetResponse(Budget budget) =>
     new(
@@ -2135,6 +2798,8 @@ static async Task EnsureDatabaseAndSchemaAsync(IConfiguration configuration, IHo
     // We consider the schema "initialized" only when several core tables exist.
     // If users exists but other tables are missing, we fail fast with an actionable message
     // rather than trying to re-run a non-idempotent bootstrap script.
+    var schemaIsInitialized = false;
+
     await using (var schemaCheck = new NpgsqlCommand("""
         SELECT
             to_regclass('public.users')::text        AS users_table,
@@ -2169,15 +2834,20 @@ static async Task EnsureDatabaseAndSchemaAsync(IConfiguration configuration, IHo
 
         if (hasAllCoreTables)
         {
-            return;
+            schemaIsInitialized = true;
         }
-
-        if (hasAnyCoreTable)
+        else if (hasAnyCoreTable)
         {
             throw new InvalidOperationException(
                 $"Database '{databaseName}' exists but is only partially initialized. " +
                 "Drop the database and re-run the API to bootstrap it from Postgre.sql.");
         }
+    }
+
+    if (schemaIsInitialized)
+    {
+        await EnsureSchemaCompatibilityAsync(dbConnection, ct);
+        return;
     }
 
     var candidatePaths = new[]
@@ -2200,9 +2870,139 @@ static async Task EnsureDatabaseAndSchemaAsync(IConfiguration configuration, IHo
         CommandTimeout = 0
     };
     await scriptCommand.ExecuteNonQueryAsync(ct);
+    await EnsureSchemaCompatibilityAsync(dbConnection, ct);
 }
 
 static string QuoteIdentifier(string identifier) => $"\"{identifier.Replace("\"", "\"\"")}\"";
+
+static async Task EnsureSchemaCompatibilityAsync(NpgsqlConnection dbConnection, CancellationToken ct)
+{
+    await using var command = new NpgsqlCommand("""
+        ALTER TABLE IF EXISTS groups
+        ADD COLUMN IF NOT EXISTS color VARCHAR(10);
+
+        CREATE TABLE IF NOT EXISTS group_resource_access (
+            group_id       UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            account_id     UUID REFERENCES accounts(id) ON DELETE CASCADE,
+            saving_id      INT REFERENCES savings(id) ON DELETE CASCADE,
+            transaction_id INT REFERENCES transactions(id) ON DELETE CASCADE,
+            shared_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+            CHECK (
+                (account_id IS NOT NULL)::int +
+                (saving_id IS NOT NULL)::int +
+                (transaction_id IS NOT NULL)::int = 1
+            ),
+            UNIQUE (group_id, account_id),
+            UNIQUE (group_id, saving_id),
+            UNIQUE (group_id, transaction_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_group_resource_access_group_id
+            ON group_resource_access(group_id);
+        CREATE INDEX IF NOT EXISTS idx_group_resource_access_account_id
+            ON group_resource_access(account_id);
+        CREATE INDEX IF NOT EXISTS idx_group_resource_access_saving_id
+            ON group_resource_access(saving_id);
+        CREATE INDEX IF NOT EXISTS idx_group_resource_access_transaction_id
+            ON group_resource_access(transaction_id);
+
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'accounts' AND column_name = 'group_id'
+            ) THEN
+                INSERT INTO group_resource_access (group_id, account_id, shared_by)
+                SELECT group_id, id, user_id
+                FROM accounts
+                WHERE group_id IS NOT NULL
+                ON CONFLICT (group_id, account_id) DO NOTHING;
+
+                ALTER TABLE accounts DROP COLUMN group_id;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'savings' AND column_name = 'group_id'
+            ) THEN
+                INSERT INTO group_resource_access (group_id, saving_id, shared_by)
+                SELECT group_id, id, user_id
+                FROM savings
+                WHERE group_id IS NOT NULL
+                ON CONFLICT (group_id, saving_id) DO NOTHING;
+
+                ALTER TABLE savings DROP COLUMN group_id;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'transactions' AND column_name = 'group_id'
+            ) THEN
+                INSERT INTO group_resource_access (group_id, transaction_id, shared_by)
+                SELECT t.group_id, t.id, a.user_id
+                FROM transactions t
+                JOIN accounts a ON a.id = t.account_id
+                WHERE t.group_id IS NOT NULL
+                ON CONFLICT (group_id, transaction_id) DO NOTHING;
+
+                ALTER TABLE transactions DROP COLUMN group_id;
+            END IF;
+        END $$;
+    """, dbConnection)
+    {
+        CommandTimeout = 0
+    };
+    await command.ExecuteNonQueryAsync(ct);
+}
+
+static async Task<bool> IsRegistrationEnabledAsync(string contentRootPath, CancellationToken ct)
+{
+    var settings = await ReadFileAppSettingsAsync(contentRootPath, ct);
+    return settings.RegistrationEnabled;
+}
+
+static async Task SetRegistrationEnabledAsync(string contentRootPath, bool enabled, CancellationToken ct)
+{
+    var settings = await ReadFileAppSettingsAsync(contentRootPath, ct);
+    settings = settings with { RegistrationEnabled = enabled };
+    await WriteFileAppSettingsAsync(contentRootPath, settings, ct);
+}
+
+static async Task<FileAppSettings> ReadFileAppSettingsAsync(string contentRootPath, CancellationToken ct)
+{
+    var path = GetAppSettingsFilePath(contentRootPath);
+    if (!File.Exists(path))
+    {
+        var defaults = new FileAppSettings(true);
+        await WriteFileAppSettingsAsync(contentRootPath, defaults, ct);
+        return defaults;
+    }
+
+    await using var stream = File.OpenRead(path);
+    var settings = await JsonSerializer.DeserializeAsync<FileAppSettings>(stream, CreateAppSettingsJsonOptions(), ct);
+    return settings ?? new FileAppSettings(true);
+}
+
+static async Task WriteFileAppSettingsAsync(string contentRootPath, FileAppSettings settings, CancellationToken ct)
+{
+    var path = GetAppSettingsFilePath(contentRootPath);
+    var tempPath = $"{path}.tmp";
+    await using (var stream = File.Create(tempPath))
+    {
+        await JsonSerializer.SerializeAsync(stream, settings, CreateAppSettingsJsonOptions(), ct);
+    }
+
+    File.Move(tempPath, path, true);
+}
+
+static string GetAppSettingsFilePath(string contentRootPath) => Path.Combine(contentRootPath, AppSettingsFileName);
+
+static JsonSerializerOptions CreateAppSettingsJsonOptions() => new()
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    PropertyNameCaseInsensitive = true,
+    WriteIndented = true
+};
 
 static void AppendAuthCookies(
     HttpContext context,
@@ -2255,3 +3055,5 @@ static void ClearAuthCookies(
         Path = refreshCookiePath
     });
 }
+
+public sealed record FileAppSettings(bool RegistrationEnabled);

@@ -29,3 +29,7 @@ public record RefreshResponse(
     DateTimeOffset AccessTokenExpiresAt,
     DateTimeOffset RefreshTokenExpiresAt
 );
+
+public record AppSettingsResponse(bool RegistrationEnabled);
+
+public record UpdateAppSettingsRequest(bool RegistrationEnabled);

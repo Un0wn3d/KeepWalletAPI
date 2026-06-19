@@ -34,7 +34,8 @@ public record SavingResponse(
     string Currency,
     string? IconKey,
     string? Color,
-    bool IsCompleted
+    bool IsCompleted,
+    string? OwnerDisplay = null
 );
 
 public record CreateSavingItemRequest(
